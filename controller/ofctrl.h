@@ -31,12 +31,20 @@ struct ovsrec_bridge;
 struct sbrec_meter_table;
 struct shash;
 
+struct updated_flow {
+    struct ovs_list list_node;
+    size_t hash;                /* Hash value. */
+};
+
 struct ovn_desired_flow_table {
     /* Hash map flow table using flow match conditions as hash key.*/
     struct hmap match_flow_table;
 
     /* SB uuid index for the nodes in match_flow_table.*/
     struct hindex uuid_flow_table;
+
+    /* Hash of the flows which got removed, added or updated during this run */
+    struct ovs_list updated_flows;
 };
 
 /* Interface for OVN main loop. */
