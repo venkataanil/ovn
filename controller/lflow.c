@@ -42,11 +42,14 @@ COVERAGE_DEFINE(lflow_run);
 
 /* Contains "struct expr_symbol"s for fields supported by OVN lflows. */
 static struct shash symtab;
+static struct hmap dp_map;
+static struct sset local_lport_ids = SSET_INITIALIZER(&local_lport_ids);
 
 void
 lflow_init(void)
 {
     ovn_init_symtab(&symtab);
+    hmap_init(&dp_map);
 }
 
 struct lookup_port_aux {
@@ -338,6 +341,7 @@ lflow_handle_changed_flows(struct lflow_ctx_in *l_ctx_in,
             VLOG_DBG("handle deleted lflow "UUID_FMT,
                      UUID_ARGS(&lflow->header_.uuid));
             ofctrl_remove_flows(l_ctx_out->flow_table, &lflow->header_.uuid);
+            remove_flow_uuid_from_port_map(&lflow->header_.uuid);
             /* Delete entries from lflow resource reference. */
             lflow_resource_destroy_lflow(l_ctx_out->lfrr,
                                          &lflow->header_.uuid);
@@ -358,6 +362,7 @@ lflow_handle_changed_flows(struct lflow_ctx_in *l_ctx_in,
                          UUID_ARGS(&lflow->header_.uuid));
                 ofctrl_remove_flows(l_ctx_out->flow_table,
                                     &lflow->header_.uuid);
+                remove_flow_uuid_from_port_map(&lflow->header_.uuid);
                 /* Delete entries from lflow resource reference. */
                 lflow_resource_destroy_lflow(l_ctx_out->lfrr,
                                              &lflow->header_.uuid);
@@ -377,6 +382,100 @@ lflow_handle_changed_flows(struct lflow_ctx_in *l_ctx_in,
     nd_ra_opts_destroy(&nd_ra_opts);
     controller_event_opts_destroy(&controller_event_opts);
     return ret;
+}
+
+void
+add_logical_flows_for_port_binding_changes(
+    struct lflow_ctx_in *l_ctx_in,
+    struct lflow_ctx_out *l_ctx_out,
+    const struct uuid *sb_uuid)
+{
+    struct hmap dhcp_opts = HMAP_INITIALIZER(&dhcp_opts);
+    struct hmap dhcpv6_opts = HMAP_INITIALIZER(&dhcpv6_opts);
+    const struct sbrec_dhcp_options *dhcp_opt_row;
+    SBREC_DHCP_OPTIONS_TABLE_FOR_EACH (dhcp_opt_row,
+                                       l_ctx_in->dhcp_options_table) {
+        dhcp_opt_add(&dhcp_opts, dhcp_opt_row->name, dhcp_opt_row->code,
+                     dhcp_opt_row->type);
+    }
+
+    const struct sbrec_dhcpv6_options *dhcpv6_opt_row;
+    SBREC_DHCPV6_OPTIONS_TABLE_FOR_EACH (dhcpv6_opt_row,
+                                         l_ctx_in->dhcpv6_options_table) {
+       dhcp_opt_add(&dhcpv6_opts, dhcpv6_opt_row->name, dhcpv6_opt_row->code,
+                    dhcpv6_opt_row->type);
+    }
+
+    struct hmap nd_ra_opts = HMAP_INITIALIZER(&nd_ra_opts);
+    nd_ra_opts_init(&nd_ra_opts);
+
+    struct controller_event_options controller_event_opts;
+    controller_event_opts_init(&controller_event_opts);
+
+    const struct sbrec_logical_flow *lflow =
+        sbrec_logical_flow_table_get_for_uuid(l_ctx_in->logical_flow_table,
+                                              sb_uuid);
+    if (!lflow) {
+        VLOG_DBG("lflow "UUID_FMT", not found.", UUID_ARGS(sb_uuid));
+        return;
+    }
+    ofctrl_remove_flows(l_ctx_out->flow_table, sb_uuid);
+    consider_logical_flow(lflow, &dhcp_opts, &dhcpv6_opts,
+                          &nd_ra_opts, &controller_event_opts,
+                          l_ctx_in, l_ctx_out);
+}
+
+void
+lflow_update_port_binding_flows(bool added, int64_t dp_id,
+                                int64_t port_id,
+                                struct lflow_ctx_in *l_ctx_in,
+                                struct lflow_ctx_out *l_ctx_out)
+{
+    struct dp_node *dpn;
+    HMAP_FOR_EACH_WITH_HASH (dpn, match_hmap_node, dp_id,
+                             &dp_map) {
+        struct port_node *pn;
+        HMAP_FOR_EACH_WITH_HASH (pn, match_hmap_node, port_id,
+                             &dpn->port_map) {
+            if (added) {
+                add_logical_flows_for_port_binding_changes(l_ctx_in,
+                    l_ctx_out, &pn->sb_uuid);
+            } else {
+                ofctrl_remove_flows(l_ctx_out->flow_table, &pn->sb_uuid);
+                hmap_remove(&dpn->port_map, &pn->match_hmap_node);
+                free(pn);
+            }
+        }
+    }
+}
+
+void
+lflow_handle_port_binding_changes(const struct sbrec_port_binding_table *port_binding_table,
+                                  struct lflow_ctx_in *l_ctx_in,
+                                  struct lflow_ctx_out *l_ctx_out)
+{
+    const struct sbrec_port_binding *binding_rec;
+    SBREC_PORT_BINDING_TABLE_FOR_EACH_TRACKED (binding_rec,
+                                               port_binding_table) {
+        char buf[16];
+        int64_t dp_id = binding_rec->datapath->tunnel_key;
+        int64_t port_id = binding_rec->tunnel_key;
+        snprintf(buf, sizeof(buf), "%"PRId64"_%"PRId64,
+                 dp_id, port_id);
+        if (sset_contains(l_ctx_in->local_lport_ids, buf)) {
+            sset_add(&local_lport_ids, buf);
+            lflow_update_port_binding_flows(true, dp_id, port_id,
+                                            l_ctx_in, l_ctx_out);
+        } else {
+        struct sset_node *node;
+            node = sset_find(&local_lport_ids, buf);
+            if (node) {
+                sset_delete(&local_lport_ids, node);
+                lflow_update_port_binding_flows(false, dp_id, port_id,
+                                                l_ctx_in, l_ctx_out);
+            }
+        }
+    }
 }
 
 bool
@@ -480,6 +579,57 @@ update_conj_id_ofs(uint32_t *conj_id_ofs, uint32_t n_conjs)
     }
     *conj_id_ofs += n_conjs;
     return true;
+}
+
+void
+add_flow_uuid_to_port_map(int64_t dp_id, int64_t port_id, const struct uuid *sb_uuid)
+{
+    struct dp_node *dpn = NULL;
+
+    HMAP_FOR_EACH_WITH_HASH (dpn, match_hmap_node, dp_id,
+                             &dp_map) {
+        break;
+    }
+    if(!dpn) {
+        dpn = xmalloc(sizeof *dpn);
+        dpn->match_hmap_node.hash = (uint32_t) dp_id;
+        hmap_insert(&dp_map, &dpn->match_hmap_node,
+                      dpn->match_hmap_node.hash);
+    }
+
+    struct port_node *pn = xmalloc(sizeof *pn);
+    pn->match_hmap_node.hash = (uint32_t) port_id;
+    pn->uuid_hindex_node.hash = uuid_hash(sb_uuid);
+    pn->sb_uuid = *sb_uuid;
+    pn->local_port = true;
+    hmap_insert(&dpn->port_map, &pn->match_hmap_node,
+                pn->match_hmap_node.hash);    
+    hindex_insert(&dpn->uuid_flow_table, &pn->uuid_hindex_node,
+                  pn->uuid_hindex_node.hash);    
+}
+
+void
+remove_flow_uuid_from_port_map(const struct uuid *sb_uuid)
+{
+    struct dp_node *dpn, *dnext;
+    HMAP_FOR_EACH_SAFE (dpn, dnext, match_hmap_node,
+                        &dp_map) {
+        struct port_node *pn, *pnext;
+        HINDEX_FOR_EACH_WITH_HASH_SAFE (pn, pnext, uuid_hindex_node,
+                                        uuid_hash(sb_uuid),
+                                        &dpn->uuid_flow_table) {
+            if (uuid_equals(&pn->sb_uuid, sb_uuid)) {
+                hmap_remove(&dpn->port_map,
+                            &pn->match_hmap_node);
+                hindex_remove(&dpn->uuid_flow_table, &pn->uuid_hindex_node);
+                free(pn);
+            }
+        }
+        if (hmap_is_empty(&dpn->port_map)) {
+            hmap_remove(&dp_map, &dpn->match_hmap_node);
+            free(dpn);
+        }
+    }
 }
 
 static bool
@@ -649,6 +799,7 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
                 int64_t dp_id = lflow->logical_datapath->tunnel_key;
                 char buf[16];
                 snprintf(buf, sizeof(buf), "%"PRId64"_%"PRId64, dp_id, port_id);
+                add_flow_uuid_to_port_map(dp_id, port_id, &lflow->header_.uuid);
                 if (!sset_contains(l_ctx_in->local_lport_ids, buf)) {
                     VLOG_DBG("lflow "UUID_FMT
                              " port %s in match is not local, skip",
@@ -846,4 +997,6 @@ lflow_destroy(void)
 {
     expr_symtab_destroy(&symtab);
     shash_destroy(&symtab);
+    hmap_destroy(&dp_map);
+    sset_destroy(&local_lport_ids);
 }

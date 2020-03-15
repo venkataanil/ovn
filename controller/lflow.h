@@ -37,6 +37,7 @@
 #include "openvswitch/hmap.h"
 #include "openvswitch/uuid.h"
 #include "openvswitch/list.h"
+#include "hindex.h"
 
 struct ovn_extend_table;
 struct ovsdb_idl_index;
@@ -48,6 +49,7 @@ struct sbrec_dhcp_options_table;
 struct sbrec_dhcpv6_options_table;
 struct sbrec_logical_flow_table;
 struct sbrec_mac_binding_table;
+struct sbrec_port_binding_table;
 struct simap;
 struct sset;
 struct uuid;
@@ -157,4 +159,37 @@ void lflow_destroy(void);
 
 void lflow_expr_destroy(struct hmap *lflow_expr_cache);
 
+struct dp_node {
+    struct hmap_node match_hmap_node;
+    struct hmap port_map;
+    struct hindex uuid_flow_table;
+};
+
+struct port_node {
+    struct hmap_node match_hmap_node;
+    struct hindex_node uuid_hindex_node;
+    struct uuid sb_uuid;
+    /* if the port bound to this chassis */
+    bool local_port;
+};
+
+void
+add_logical_flows_for_port_binding_changes(
+    struct lflow_ctx_in *l_ctx_in,
+    struct lflow_ctx_out *l_ctx_out,
+    const struct uuid *sb_uuid);
+void
+lflow_update_port_binding_flows(bool added, int64_t dp_id,
+                                int64_t port_id,
+                                struct lflow_ctx_in *l_ctx_in,
+                                struct lflow_ctx_out *l_ctx_out);
+void
+lflow_handle_port_binding_changes(const struct sbrec_port_binding_table *port_binding_table,
+                                  struct lflow_ctx_in *l_ctx_in,
+                                  struct lflow_ctx_out *l_ctx_out);
+void
+add_flow_uuid_to_port_map(int64_t dpid, int64_t port_id,
+                          const struct uuid *sb_uuid);
+void
+remove_flow_uuid_from_port_map(const struct uuid *sb_uuid);
 #endif /* controller/lflow.h */
