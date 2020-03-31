@@ -954,6 +954,114 @@ port_groups_sb_port_group_handler(struct engine_node *node, void *data)
     return true;
 }
 
+struct ed_type_port_binding{
+    struct hmap local_datapaths;
+    bool change_tracked;
+    struct sset new;
+    struct sset deleted;
+    struct sset updated;
+    struct sset local_lport_ids;
+
+};
+
+static void *
+en_port_binding_init(struct engine_node *node OVS_UNUSED,
+                    struct engine_arg *arg OVS_UNUSED)
+{
+    struct ed_type_port_binding *pb = xzalloc(sizeof *pb);
+    hmap_init(&pb->local_datapaths);
+    pb->change_tracked = false;
+    sset_init(&pb->new);
+    sset_init(&pb->deleted);
+    sset_init(&pb->updated);
+    sset_init(&pb->local_lport_ids);
+    return pb;
+}
+
+static void
+en_port_binding_cleanup(void *data)
+{
+    struct ed_type_port_binding *pb = data;
+    sset_destroy(&pb->new);
+    sset_destroy(&pb->deleted);
+    sset_destroy(&pb->updated);
+    sset_destroy(&pb->local_lport_ids);
+    struct local_datapath *cur_node, *next_node;
+    HMAP_FOR_EACH_SAFE (cur_node, next_node, hmap_node,
+                        &pb->local_datapaths) {
+        free(cur_node->peer_ports);
+        hmap_remove(&pb->local_datapaths, &cur_node->hmap_node);
+        free(cur_node);
+    }
+    hmap_destroy(&pb->local_datapaths);    
+}
+
+
+static void
+en_port_binding_run(struct engine_node *node, void *data)
+{
+    struct ed_type_port_binding *pb = data;
+
+    sset_clear(&pb->new);
+    sset_clear(&pb->deleted);
+    sset_clear(&pb->updated);
+
+    pb->change_tracked = false;
+    engine_set_node_state(node, EN_UPDATED);
+}
+
+static void
+port_binding_update(const struct sbrec_port_binding_table *port_binding_table,
+                   struct sset *new,
+                   struct sset *deleted, struct sset *updated)
+{
+    struct sset ports_updated = SSET_INITIALIZER(&ports_updated);
+    const struct sbrec_port_binding *pb;
+
+    SBREC_PORT_BINDING_TABLE_FOR_EACH_TRACKED (pb, port_binding_table) {
+        int64_t dp_id = pb->datapath->tunnel_key;
+        int64_t port_id = pb->tunnel_key;
+        char name[16];
+        snprintf(name, sizeof(name), "%"PRId64"_%"PRId64, dp_id, port_id);
+        if (sbrec_port_binding_is_deleted(pb)) {
+            sset_add(deleted, name);
+        } else {
+            if (sbrec_port_binding_is_new(pb)) {
+                sset_add(new, name);
+            } else {
+                    sset_add(updated, name);
+            }
+        }
+    }
+}
+
+static bool
+port_binding_sb_port_binding_handler(struct engine_node *node, void *data)
+{
+    struct ed_type_port_binding *pb = data;
+
+    sset_clear(&pb->new);
+    sset_clear(&pb->deleted);
+    sset_clear(&pb->updated);
+
+    struct sbrec_port_binding_table *pb_table =
+        (struct sbrec_port_binding_table *)EN_OVSDB_GET(
+            engine_get_input("SB_port_binding", node));
+
+    port_binding_update(pb_table, &pb->new,
+                     &pb->deleted, &pb->updated);
+
+    if (!sset_is_empty(&pb->new) || !sset_is_empty(&pb->deleted) ||
+            !sset_is_empty(&pb->updated)) {
+        engine_set_node_state(node, EN_UPDATED);
+    } else {
+        engine_set_node_state(node, EN_VALID);
+    }
+
+    pb->change_tracked = false;
+    return true;
+}
+
 struct ed_type_runtime_data {
     /* Contains "struct local_datapath" nodes. */
     struct hmap local_datapaths;
@@ -1141,6 +1249,40 @@ runtime_data_sb_port_binding_handler(struct engine_node *node, void *data)
 
     return !changed;
 }
+
+void
+update_pb_local_ports_and_datapaths(struct ed_type_port_binding *pb,
+    struct ed_type_runtime_data *rt_data) {
+    sset_clear(&pb->local_lport_ids);
+
+    /* clear all cached local_lport_ids and then copy from the
+     * newly built local_lport_ids */
+    const char *port, *next;
+    SSET_FOR_EACH_SAFE (port, next, &rt_data->local_lport_ids) {
+        sset_add(&pb->local_lport_ids, port);
+    }
+
+    /* clear all cached local datapaths */
+    struct local_datapath *cur_node, *next_node;
+    HMAP_FOR_EACH_SAFE (cur_node, next_node, hmap_node, &pb->local_datapaths) {
+        free(cur_node->peer_ports);
+        hmap_remove(&pb->local_datapaths, &cur_node->hmap_node);
+        free(cur_node);
+    }
+    hmap_clear(&pb->local_datapaths); 
+
+    /* copy newly build local datapaths to cache */
+    HMAP_FOR_EACH_SAFE (cur_node, next_node, hmap_node, &rt_data->local_datapaths) {
+        struct local_datapath *ld = xzalloc(sizeof *ld);
+        ld->hmap_node.hash = cur_node->hmap_node.hash;
+        ld->datapath = cur_node->datapath;
+        ld->localnet_port = cur_node->localnet_port;
+        ld->has_local_l3gateway = cur_node->has_local_l3gateway;
+        hmap_insert(&pb->local_datapaths, &ld->hmap_node,
+                    ld->hmap_node.hash);
+    }
+}
+
 
 /* Connection tracking zones. */
 struct ed_type_ct_zones {
@@ -1410,6 +1552,9 @@ en_flow_output_run(struct engine_node *node, void *data)
     struct ed_type_runtime_data *rt_data =
         engine_get_input_data("runtime_data", node);
 
+    struct ed_type_port_binding *pb =
+        engine_get_input_data("port_binding", node);
+
     struct ovsrec_open_vswitch_table *ovs_table =
         (struct ovsrec_open_vswitch_table *)EN_OVSDB_GET(
             engine_get_input("OVS_open_vswitch", node));
@@ -1458,6 +1603,8 @@ en_flow_output_run(struct engine_node *node, void *data)
     init_physical_ctx(node, rt_data, &p_ctx);
 
     physical_run(&p_ctx, &fo->flow_table);
+
+    update_pb_local_ports_and_datapaths(pb, rt_data);
 
     engine_set_node_state(node, EN_UPDATED);
 }
@@ -1514,71 +1661,6 @@ flow_output_sb_mac_binding_handler(struct engine_node *node, void *data)
 }
 
 static bool
-flow_output_sb_port_binding_handler(struct engine_node *node, void *data)
-{
-    struct ed_type_runtime_data *rt_data =
-        engine_get_input_data("runtime_data", node);
-
-    struct ed_type_flow_output *fo = data;
-    struct ovn_desired_flow_table *flow_table = &fo->flow_table;
-
-    /* XXX: now we handle port-binding changes for physical flow processing
-     * only, but port-binding change can have impact to logical flow
-     * processing, too, in below circumstances:
-     *
-     *  - When a port-binding for a lport is inserted/deleted but the lflow
-     *    using that lport doesn't change.
-     *
-     *    This can happen only when the lport name is used by ACL match
-     *    condition, which is specified by user. Even in that case, if the port
-     *    is actually bound on the current chassis it will trigger recompute on
-     *    that chassis since ovs interface would be updated. So the only
-     *    situation this would have real impact is when user defines an ACL
-     *    that includes lport that is not on current chassis, and there is a
-     *    port-binding creation/deletion related to that lport.e.g.: an ACL is
-     *    defined:
-     *
-     *    to-lport 1000 'outport=="A" && inport=="B"' allow-related
-     *
-     *    If "A" is on current chassis, but "B" is lport that hasn't been
-     *    created yet. When a lport "B" is created and bound on another
-     *    chassis, the ACL will not take effect on the current chassis until a
-     *    recompute is triggered later. This case doesn't seem to be a problem
-     *    for real world use cases because usually lport is created before
-     *    being referenced by name in ACLs.
-     *
-     *  - When is_chassis_resident(<lport>) is used in lflow. In this case the
-     *    port binding is not a regular VIF. It can be either "patch" or
-     *    "external", with ha-chassis-group assigned.  In current
-     *    "runtime_data" handling, port-binding changes for these types always
-     *    trigger recomputing. So it is fine even if we do not handle it here.
-     *    (due to the ovsdb tracking support for referenced table changes,
-     *    ha-chassis-group changes will appear as port-binding change).
-     *
-     *  - When a mac-binding doesn't change but the port-binding related to
-     *    that mac-binding is deleted. In this case the neighbor flow generated
-     *    for the mac-binding should be deleted. This would not cause any real
-     *    issue for now, since the port-binding related to mac-binding is
-     *    always logical router port, and any change to logical router port
-     *    would just trigger recompute.
-     *
-     * Although there is no correctness issue so far (except the unusual ACL
-     * use case, which doesn't seem to be a real problem), it might be better
-     * to handle this more gracefully, without the need to consider these
-     * tricky scenarios.  One approach is to maintain a mapping between lport
-     * names and the lflows that uses them, and reprocess the related lflows
-     * when related port-bindings change.
-     */
-    struct physical_ctx p_ctx;
-    init_physical_ctx(node, rt_data, &p_ctx);
-
-    physical_handle_port_binding_changes(&p_ctx, flow_table);
-
-    engine_set_node_state(node, EN_UPDATED);
-    return true;
-}
-
-static bool
 flow_output_sb_multicast_group_handler(struct engine_node *node, void *data)
 {
     struct ed_type_runtime_data *rt_data =
@@ -1609,6 +1691,9 @@ _flow_output_resource_ref_handler(struct engine_node *node, void *data,
 
     struct ed_type_port_groups *pg_data =
         engine_get_input_data("port_groups", node);
+
+    struct ed_type_port_binding *pb_data =
+        engine_get_input_data("port_binding", node);
 
     struct ovsrec_open_vswitch_table *ovs_table =
         (struct ovsrec_open_vswitch_table *)EN_OVSDB_GET(
@@ -1659,6 +1744,14 @@ _flow_output_resource_ref_handler(struct engine_node *node, void *data,
             updated = &pg_data->updated;
             deleted = &pg_data->deleted;
             break;
+        case REF_TYPE_PORTBINDING:
+            if (!pb_data->change_tracked) {
+                return false;
+            }
+            new = &pb_data->new;
+            updated = &pb_data->updated;
+            deleted = &pb_data->deleted;
+            break;
         default:
             OVS_NOT_REACHED();
     }
@@ -1696,6 +1789,142 @@ _flow_output_resource_ref_handler(struct engine_node *node, void *data,
 }
 
 static bool
+logical_handle_port_bidning_changes(struct engine_node *node, void *data) {
+    bool ret = true;
+
+    struct ed_type_port_groups *pg =
+        engine_get_input_data("port_groups", node);
+
+    struct ed_type_port_binding *pb =
+        engine_get_input_data("port_binding", node);
+
+    struct ed_type_runtime_data *rt_data =
+        engine_get_input_data("runtime_data", node);
+
+    /* If port added to this host or removed from this host, then
+     * add it to ports_updated sset */
+    struct sset ports_updated = SSET_INITIALIZER(&ports_updated);
+    bool pb_changed = false;
+    bool pg_changed = false;
+
+    /* rt_data will have updated local_lport_ids whereas pb->local_lport_ids
+     * is pervious run cache.
+     * If the binding is added or removed from this host, it should be part
+     * of either rt_data->local_lport_ids or cached pb->local_lport_ids.
+     * */
+    const char *port, *next;
+    SSET_FOR_EACH (port, &pb->new) {
+        if (sset_contains(&rt_data->local_lport_ids, port) ||
+            sset_contains(&pb->local_lport_ids, port)) {
+            sset_add(&ports_updated, port);
+            continue;
+        }
+        sset_delete(&pb->new, SSET_NODE_FROM_NAME(port));
+    }
+    SSET_FOR_EACH_SAFE (port, next, &pb->updated) {
+        if (sset_contains(&rt_data->local_lport_ids, port) ||
+            sset_contains(&pb->local_lport_ids, port)) {
+            sset_add(&ports_updated, port);
+            continue;
+        }
+        sset_delete(&pb->updated, SSET_NODE_FROM_NAME(port));
+    }
+    SSET_FOR_EACH_SAFE (port, next, &pb->deleted) {
+        if (sset_contains(&rt_data->local_lport_ids, port) ||
+            sset_contains(&pb->local_lport_ids, port)) {
+            sset_add(&ports_updated, port);
+            continue;
+        }
+        sset_delete(&pb->deleted, SSET_NODE_FROM_NAME(port));
+    }
+
+    /* for binding added or removed from this host */
+    SSET_FOR_EACH_SAFE (port, next, &ports_updated) {
+        pb_changed = true;
+        struct shash_node *pg_node, *node_next;
+        /* Iterate trough all port groups and find port groups
+         * part of this port and then mark them as updated
+         * so that lflows will be applied on these port groups */
+        SHASH_FOR_EACH_SAFE (pg_node, node_next, &pg->port_groups) {
+            const char *pg_name = pg_node->name;
+            struct expr_constant_set *cs = pg_node->data;
+            if (cs) {
+                if (cs->type == EXPR_C_STRING) {
+                    for (size_t i = 0; i < cs->n_values; i++) {
+                        if (!strcmp(cs->values[i].string, port)) {
+                            sset_add(&pg->updated, pg_name);
+                            pg_changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct local_datapath *cur_node, *next_node;
+    if (pb_changed) {
+        pb->change_tracked = true;
+        bool datapath_updated = true;
+
+        /* Iterate through current local datapaths (i.e rt_data->local_datapaths)
+         * and cached local datapaths from previous run (i.e pb->local_datapaths)
+         * to identify if local datapath is added to or removed from this host.
+         * When local datapath is added or removed, this handler will return false
+         * to trigger engine force recompute */
+        HMAP_FOR_EACH_SAFE (cur_node, next_node, hmap_node, &pb->local_datapaths) {
+           struct local_datapath *ld;
+            HMAP_FOR_EACH_WITH_HASH (ld, hmap_node, cur_node->hmap_node.hash,
+                             &rt_data->local_datapaths) {
+                datapath_updated = false;
+                break;
+            }
+        }
+        HMAP_FOR_EACH_SAFE (cur_node, next_node, hmap_node, &rt_data->local_datapaths) {
+           struct local_datapath *ld;
+            HMAP_FOR_EACH_WITH_HASH (ld, hmap_node, cur_node->hmap_node.hash,
+                             &pb->local_datapaths) {
+                datapath_updated = false;
+            }
+        }
+        /* Apply logical flows for the referenced ports and then port groups */
+        if (!datapath_updated) { 
+            ret = _flow_output_resource_ref_handler(node, data, REF_TYPE_PORTBINDING);
+            if (pg_changed) {
+                pg->change_tracked = true;
+                ret = _flow_output_resource_ref_handler(node, data, REF_TYPE_PORTGROUP);
+            }
+        } else {
+            ret = false;
+        }
+    }
+
+    sset_destroy(&ports_updated);
+    update_pb_local_ports_and_datapaths(pb, rt_data);
+
+    return ret;
+}
+
+static bool
+flow_output_sb_port_binding_handler(struct engine_node *node, void *data)
+{
+    struct ed_type_runtime_data *rt_data =
+        engine_get_input_data("runtime_data", node);
+
+    struct ed_type_flow_output *fo = data;
+    struct ovn_desired_flow_table *flow_table = &fo->flow_table;
+
+    bool ret = true;
+    struct physical_ctx p_ctx;
+    init_physical_ctx(node, rt_data, &p_ctx);
+
+    physical_handle_port_binding_changes(&p_ctx, flow_table);
+    ret = logical_handle_port_bidning_changes(node, data);
+
+    engine_set_node_state(node, EN_UPDATED);
+    return ret;
+}
+
+static bool
 flow_output_addr_sets_handler(struct engine_node *node, void *data)
 {
     return _flow_output_resource_ref_handler(node, data, REF_TYPE_ADDRSET);
@@ -1706,6 +1935,7 @@ flow_output_port_groups_handler(struct engine_node *node, void *data)
 {
     return _flow_output_resource_ref_handler(node, data, REF_TYPE_PORTGROUP);
 }
+
 
 struct ovn_controller_exit_args {
     bool *exiting;
@@ -1832,6 +2062,7 @@ main(int argc, char *argv[])
     ENGINE_NODE(flow_output, "flow_output");
     ENGINE_NODE(addr_sets, "addr_sets");
     ENGINE_NODE(port_groups, "port_groups");
+    ENGINE_NODE(port_binding, "port_binding");
 
 #define SB_NODE(NAME, NAME_STR) ENGINE_NODE_SB(NAME, NAME_STR);
     SB_NODES
@@ -1847,6 +2078,8 @@ main(int argc, char *argv[])
                      addr_sets_sb_address_set_handler);
     engine_add_input(&en_port_groups, &en_sb_port_group,
                      port_groups_sb_port_group_handler);
+    engine_add_input(&en_port_binding, &en_sb_port_binding,
+                     port_binding_sb_port_binding_handler);
 
     engine_add_input(&en_flow_output, &en_addr_sets,
                      flow_output_addr_sets_handler);
@@ -1863,7 +2096,8 @@ main(int argc, char *argv[])
     engine_add_input(&en_flow_output, &en_sb_encap, NULL);
     engine_add_input(&en_flow_output, &en_sb_multicast_group,
                      flow_output_sb_multicast_group_handler);
-    engine_add_input(&en_flow_output, &en_sb_port_binding,
+    engine_add_input(&en_flow_output, &en_sb_port_binding, NULL);
+    engine_add_input(&en_flow_output, &en_port_binding,
                      flow_output_sb_port_binding_handler);
     engine_add_input(&en_flow_output, &en_sb_mac_binding,
                      flow_output_sb_mac_binding_handler);

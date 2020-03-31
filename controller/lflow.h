@@ -72,7 +72,8 @@ struct uuid;
 
 enum ref_type {
     REF_TYPE_ADDRSET,
-    REF_TYPE_PORTGROUP
+    REF_TYPE_PORTGROUP,
+    REF_TYPE_PORTBINDING
 };
 
 /* Maintains the relationship for a pair of named resource and
