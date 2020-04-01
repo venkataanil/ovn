@@ -57,6 +57,8 @@ struct binding_ctx_out {
     struct sset *local_lport_ids;
     struct sset *egress_ifaces;
     struct smap *local_iface_ids;
+    struct hmap *updated_dp_bindings;
+    struct hmap *deleted_dp_bindings;
 };
 
 void binding_register_ovs_idl(struct ovsdb_idl *);
@@ -72,4 +74,6 @@ bool binding_handle_ovs_interface_changes(struct binding_ctx_in *,
                                           struct binding_ctx_out *);
 bool binding_handle_port_binding_changes(struct binding_ctx_in *,
                                          struct binding_ctx_out *);
+
+void datapath_bindings_destroy(struct hmap *datapath_bindings);
 #endif /* controller/binding.h */
