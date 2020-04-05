@@ -289,16 +289,16 @@ engine_init_run(void)
  * mark the node as "aborted".
  */
 static void
-engine_recompute(struct engine_node *node, bool forced, bool allowed)
+engine_recompute_at(struct engine_node *node, bool forced, bool allowed, const char *where)
 {
-    VLOG_DBG("node: %s, recompute (%s)", node->name,
+    VLOG_DBG("%s: node: %s, recompute (%s)", where, node->name,
              forced ? "forced" : "triggered");
 
-    if (!allowed) {
-        VLOG_DBG("node: %s, recompute aborted", node->name);
-        engine_set_node_state(node, EN_ABORTED);
-        return;
-    }
+    /* Removed below setting EN_ABORTED state as it was forcing
+     * recompute when the ct_zone engine changed. Currently ct_zone node's
+     * inputs are not having handlers, for this, instead of running en_ct_zone_run, its
+     * forcing recompute. So removed this force recompute.
+     * */
 
     /* Run the node handler which might change state. */
     node->run(node, node->data);

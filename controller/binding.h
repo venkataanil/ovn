@@ -18,8 +18,12 @@
 #define OVN_BINDING_H 1
 
 #include <stdbool.h>
+#include "openvswitch/hmap.h"
+#include "openvswitch/uuid.h"
+#include "openvswitch/list.h"
 
 struct hmap;
+struct hmap_node;
 struct ovsdb_idl;
 struct ovsdb_idl_index;
 struct ovsdb_idl_txn;
@@ -30,6 +34,7 @@ struct ovsrec_bridge_table;
 struct ovsrec_open_vswitch_table;
 struct sbrec_chassis;
 struct sbrec_port_binding_table;
+struct simap;
 struct sset;
 struct sbrec_port_binding;
 
@@ -59,6 +64,18 @@ struct binding_ctx_out {
     struct smap *local_iface_ids;
     struct hmap *updated_dp_bindings;
     struct hmap *deleted_dp_bindings;
+};
+
+/* I need sbrec_port_binding and sbrec_datapath_binding in ovn-controller.c */
+struct dp_port {
+    const struct sbrec_port_binding *pb;
+    struct ovs_list list_node;
+};
+
+struct datapath_binding {
+    struct hmap_node node;
+    const struct sbrec_datapath_binding *datapath;
+    struct ovs_list lports_head;
 };
 
 void binding_register_ovs_idl(struct ovsdb_idl *);

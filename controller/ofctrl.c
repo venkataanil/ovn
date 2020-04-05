@@ -1052,8 +1052,8 @@ add_meter(struct ovn_extend_table_info *m_desired,
 bool
 ofctrl_can_put(void)
 {
+    /* Didn't want engine_run(false); but this change is not imp, I may revert*/
     if (state != S_UPDATE_FLOWS
-        || rconn_packet_counter_n_packets(tx_counter)
         || rconn_get_version(swconn) < 0) {
         return false;
     }

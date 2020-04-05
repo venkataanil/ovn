@@ -860,9 +860,11 @@ consider_port_binding(struct ovsdb_idl_index *sbrec_port_binding_by_name,
     uint32_t dp_key = binding->datapath->tunnel_key;
     uint32_t port_key = binding->tunnel_key;
     struct local_datapath *ld;
+    VLOG_INFO("ANIL phphc consider_port_binding 1");
     if (!(ld = get_local_datapath(local_datapaths, dp_key))) {
         return;
     }
+    VLOG_INFO("ANIL phphc consider_port_binding 2");
 
     struct match match;
     if (!strcmp(binding->type, "patch")
@@ -1155,6 +1157,7 @@ consider_port_binding(struct ovsdb_idl_index *sbrec_port_binding_by_name,
                                           ofpacts_p, ofport, flow_table);
         }
 
+        VLOG_INFO("ANIL phphc consider_port_binding 3 Table 65, Priority 100");
         /* Table 65, Priority 100.
          * =======================
          *
@@ -1402,8 +1405,12 @@ physical_handle_port_binding_changes(struct physical_ctx *p_ctx,
     const struct sbrec_port_binding *binding;
     struct ofpbuf ofpacts;
     ofpbuf_init(&ofpacts, 0);
+    VLOG_INFO("ANIL phphc 1");
+    /* Currently not working as below SBREC_PORT_BINDING_TABLE_FOR_EACH_TRACKED
+     * returns empty for pb changes */
     SBREC_PORT_BINDING_TABLE_FOR_EACH_TRACKED (binding,
                                                p_ctx->port_binding_table) {
+    VLOG_INFO("ANIL phphc 2");
         if (sbrec_port_binding_is_deleted(binding)) {
             ofctrl_remove_flows(flow_table, &binding->header_.uuid);
         } else {
