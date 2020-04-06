@@ -73,7 +73,8 @@ struct uuid;
 
 enum ref_type {
     REF_TYPE_ADDRSET,
-    REF_TYPE_PORTGROUP
+    REF_TYPE_PORTGROUP,
+    REF_TYPE_PORTBINDING
 };
 
 /* Maintains the relationship for a pair of named resource and
@@ -118,6 +119,7 @@ void lflow_resource_clear(struct lflow_resource_ref *);
 
 struct lflow_ctx_in {
     struct ovsdb_idl_index *sbrec_multicast_group_by_name_datapath;
+    struct ovsdb_idl_index *sbrec_logical_flow_by_logical_datapath;
     struct ovsdb_idl_index *sbrec_port_binding_by_name;
     const struct sbrec_dhcp_options_table *dhcp_options_table;
     const struct sbrec_dhcpv6_options_table *dhcpv6_options_table;
@@ -142,6 +144,11 @@ struct lflow_ctx_out {
     uint32_t *conj_id_ofs;
 };
 
+struct lflow_dp_list_node {
+    const struct sbrec_datapath_binding *datapath;
+    struct ovs_list list_node;
+};
+
 void lflow_init(void);
 void lflow_run(struct lflow_ctx_in *, struct lflow_ctx_out *);
 bool lflow_handle_changed_flows(struct lflow_ctx_in *, struct lflow_ctx_out *);
@@ -154,9 +161,12 @@ void lflow_handle_changed_neighbors(
     const struct hmap *local_datapaths,
     struct ovn_desired_flow_table *);
 
-bool lflow_evaluate_pb_changes(const struct sbrec_port_binding_table *);
 void lflow_destroy(void);
 
 void lflow_expr_destroy(struct hmap *lflow_expr_cache);
+bool lflow_handle_flows_for_datapath(struct lflow_ctx_in *,
+                                     struct lflow_ctx_out *,
+                                     const struct ovs_list *,
+                                     const struct ovs_list *);
 
 #endif /* controller/lflow.h */

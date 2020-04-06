@@ -302,6 +302,92 @@ add_logical_flows(struct lflow_ctx_in *l_ctx_in,
 }
 
 bool
+lflow_handle_flows_for_datapath(struct lflow_ctx_in *l_ctx_in,
+                           struct lflow_ctx_out *l_ctx_out,
+                           const struct ovs_list *dp_added,
+                           const struct ovs_list *dp_deleted)
+{
+    bool ret = true;
+
+    struct hmap dhcp_opts = HMAP_INITIALIZER(&dhcp_opts);
+    struct hmap dhcpv6_opts = HMAP_INITIALIZER(&dhcpv6_opts);
+    const struct sbrec_dhcp_options *dhcp_opt_row;
+    SBREC_DHCP_OPTIONS_TABLE_FOR_EACH (dhcp_opt_row,
+                                       l_ctx_in->dhcp_options_table) {
+        dhcp_opt_add(&dhcp_opts, dhcp_opt_row->name, dhcp_opt_row->code,
+                     dhcp_opt_row->type);
+    }
+
+
+    const struct sbrec_dhcpv6_options *dhcpv6_opt_row;
+    SBREC_DHCPV6_OPTIONS_TABLE_FOR_EACH (dhcpv6_opt_row,
+                                         l_ctx_in->dhcpv6_options_table) {
+       dhcp_opt_add(&dhcpv6_opts, dhcpv6_opt_row->name, dhcpv6_opt_row->code,
+                    dhcpv6_opt_row->type);
+    }
+
+    struct hmap nd_ra_opts = HMAP_INITIALIZER(&nd_ra_opts);
+    nd_ra_opts_init(&nd_ra_opts);
+
+    /* Handle deleted datapaths */
+    struct lflow_dp_list_node *dpn, *next;
+    LIST_FOR_EACH_SAFE (dpn, next, list_node, dp_deleted) {
+        const struct sbrec_datapath_binding *datapath = dpn->datapath;
+        struct sbrec_logical_flow *lf_row = sbrec_logical_flow_index_init_row(
+            l_ctx_in->sbrec_logical_flow_by_logical_datapath);
+        sbrec_logical_flow_index_set_logical_datapath(lf_row, datapath);
+
+        const struct sbrec_logical_flow *lflow;
+        SBREC_LOGICAL_FLOW_FOR_EACH_EQUAL(lflow, lf_row,
+            l_ctx_in->sbrec_logical_flow_by_logical_datapath) {
+
+            VLOG_DBG("delete lflow "UUID_FMT" for deleted datapath "UUID_FMT,
+                 UUID_ARGS(&lflow->header_.uuid), UUID_ARGS(&datapath->header_.uuid));
+            ofctrl_remove_flows(l_ctx_out->flow_table, &lflow->header_.uuid);
+            /* Delete entries from lflow resource reference. */
+            lflow_resource_destroy_lflow(l_ctx_out->lfrr,
+                                         &lflow->header_.uuid);
+        }
+    }    
+
+    struct controller_event_options controller_event_opts;
+    controller_event_opts_init(&controller_event_opts);
+
+    /* Handle new datapaths */
+    LIST_FOR_EACH_SAFE (dpn, next, list_node, dp_added) {
+        const struct sbrec_datapath_binding *datapath = dpn->datapath;
+        struct sbrec_logical_flow *lf_row = sbrec_logical_flow_index_init_row(
+            l_ctx_in->sbrec_logical_flow_by_logical_datapath);
+        sbrec_logical_flow_index_set_logical_datapath(lf_row, datapath);
+
+        const struct sbrec_logical_flow *lflow;
+        SBREC_LOGICAL_FLOW_FOR_EACH_EQUAL(lflow, lf_row,
+            l_ctx_in->sbrec_logical_flow_by_logical_datapath) {
+
+            VLOG_DBG("delete lflow "UUID_FMT" for updated datapath "UUID_FMT,
+                 UUID_ARGS(&lflow->header_.uuid), UUID_ARGS(&datapath->header_.uuid));
+            ofctrl_remove_flows(l_ctx_out->flow_table, &lflow->header_.uuid);
+            /* Delete entries from lflow resource reference. */
+            lflow_resource_destroy_lflow(l_ctx_out->lfrr,
+                                         &lflow->header_.uuid);
+            VLOG_DBG("Add lflow "UUID_FMT" for new datapath "UUID_FMT,
+                 UUID_ARGS(&lflow->header_.uuid), UUID_ARGS(&datapath->header_.uuid));
+            if (!consider_logical_flow(lflow, &dhcp_opts, &dhcpv6_opts,
+                                       &nd_ra_opts, &controller_event_opts,
+                                       l_ctx_in, l_ctx_out)) {
+                ret = false;
+                break;
+            }
+        }
+    }    
+    dhcp_opts_destroy(&dhcp_opts);
+    dhcp_opts_destroy(&dhcpv6_opts);
+    nd_ra_opts_destroy(&nd_ra_opts);
+    controller_event_opts_destroy(&controller_event_opts);
+    return ret;
+}
+
+bool
 lflow_handle_changed_flows(struct lflow_ctx_in *l_ctx_in,
                            struct lflow_ctx_out *l_ctx_out)
 {
@@ -649,6 +735,8 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
                 int64_t dp_id = lflow->logical_datapath->tunnel_key;
                 char buf[16];
                 snprintf(buf, sizeof(buf), "%"PRId64"_%"PRId64, dp_id, port_id);
+                lflow_resource_add(l_ctx_out->lfrr, REF_TYPE_PORTBINDING, buf,
+                                   &lflow->header_.uuid);
                 if (!sset_contains(l_ctx_in->local_lport_ids, buf)) {
                     VLOG_DBG("lflow "UUID_FMT
                              " port %s in match is not local, skip",
@@ -846,17 +934,4 @@ lflow_destroy(void)
 {
     expr_symtab_destroy(&symtab);
     shash_destroy(&symtab);
-}
-
-bool
-lflow_evaluate_pb_changes(const struct sbrec_port_binding_table *pb_table)
-{
-    const struct sbrec_port_binding *binding;
-    SBREC_PORT_BINDING_TABLE_FOR_EACH_TRACKED (binding, pb_table) {
-        if (!strcmp(binding->type, "remote")) {
-            return false;
-        }
-    }
-
-    return true;
 }

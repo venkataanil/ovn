@@ -62,7 +62,9 @@ void physical_register_ovs_idl(struct ovsdb_idl *);
 void physical_run(struct physical_ctx *,
                   struct ovn_desired_flow_table *);
 void physical_handle_port_binding_changes(struct physical_ctx *,
-                                          struct ovn_desired_flow_table *);
+                                          struct ovn_desired_flow_table *,
+                                          const struct sbrec_port_binding *,
+                                          bool);
 void physical_handle_mc_group_changes(struct physical_ctx *,
                                       struct ovn_desired_flow_table *);
 bool physical_handle_ovs_iface_changes(struct physical_ctx *,

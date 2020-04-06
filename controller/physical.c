@@ -1397,26 +1397,21 @@ update_ofports(struct simap *old, struct simap *new)
 
 void
 physical_handle_port_binding_changes(struct physical_ctx *p_ctx,
-                                     struct ovn_desired_flow_table *flow_table)
+                                     struct ovn_desired_flow_table *flow_table,
+                                     const struct sbrec_port_binding *binding,
+                                     bool updated)
 {
-    const struct sbrec_port_binding *binding;
     struct ofpbuf ofpacts;
     ofpbuf_init(&ofpacts, 0);
-    SBREC_PORT_BINDING_TABLE_FOR_EACH_TRACKED (binding,
-                                               p_ctx->port_binding_table) {
-        if (sbrec_port_binding_is_deleted(binding)) {
-            ofctrl_remove_flows(flow_table, &binding->header_.uuid);
-        } else {
-            if (!sbrec_port_binding_is_new(binding)) {
-                ofctrl_remove_flows(flow_table, &binding->header_.uuid);
-            }
-            consider_port_binding(p_ctx->sbrec_port_binding_by_name,
-                                  p_ctx->mff_ovn_geneve, p_ctx->ct_zones,
-                                  p_ctx->active_tunnels,
-                                  p_ctx->local_datapaths,
-                                  binding, p_ctx->chassis,
-                                  flow_table, &ofpacts);
-        }
+
+    ofctrl_remove_flows(flow_table, &binding->header_.uuid);
+    if (updated) {
+        consider_port_binding(p_ctx->sbrec_port_binding_by_name,
+                              p_ctx->mff_ovn_geneve, p_ctx->ct_zones,
+                              p_ctx->active_tunnels,
+                              p_ctx->local_datapaths,
+                              binding, p_ctx->chassis,
+                              flow_table, &ofpacts);
     }
     ofpbuf_uninit(&ofpacts);
 }

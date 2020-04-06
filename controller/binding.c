@@ -70,7 +70,7 @@ binding_register_ovs_idl(struct ovsdb_idl *ovs_idl)
 }
 
 static struct datapath_binding *datapath_bindings_create(struct hmap *,
-                                                         const struct uuid *);
+    const struct sbrec_datapath_binding *);
 static struct datapath_binding *datapath_bindings_find(struct hmap *,
                                                        const struct uuid *);
 
@@ -100,8 +100,7 @@ add_local_datapath__(struct ovsdb_idl_index *sbrec_datapath_binding_by_key,
 
     if (updated_dp_bindings && !datapath_bindings_find(
             updated_dp_bindings, &datapath->header_.uuid)) {
-        datapath_bindings_create(updated_dp_bindings,
-                                     &datapath->header_.uuid);
+        datapath_bindings_create(updated_dp_bindings, datapath);
     }
 
     if (depth >= 100) {
@@ -597,20 +596,14 @@ local_binding_find_child(struct local_binding *lbinding,
     return NULL;
 }
 
-struct datapath_binding {
-    struct hmap_node node;
-    struct uuid dp_uuid;
-    struct sset lports;
-};
-
 static struct datapath_binding *
 datapath_bindings_create(struct hmap *datapath_bindings,
-                         const struct uuid *dp_uuid)
+                         const struct sbrec_datapath_binding *datapath)
 {
     struct datapath_binding *b = xzalloc(sizeof *b);
-    b->dp_uuid = *dp_uuid;
-    sset_init(&b->lports);
-    hmap_insert(datapath_bindings, &b->node, uuid_hash(dp_uuid));
+    b->datapath = datapath;
+    ovs_list_init(&b->lports_head);
+    hmap_insert(datapath_bindings, &b->node, uuid_hash(&datapath->header_.uuid));
     return b;
 }
 
@@ -620,7 +613,7 @@ datapath_bindings_find(struct hmap *datapath_bindings,
 {
     struct datapath_binding *b;
     HMAP_FOR_EACH_WITH_HASH (b, node, uuid_hash(dp_uuid), datapath_bindings) {
-        if (uuid_equals(&b->dp_uuid, dp_uuid)) {
+        if (uuid_equals(&b->datapath->header_.uuid, dp_uuid)) {
             return b;
         }
     }
@@ -630,18 +623,20 @@ datapath_bindings_find(struct hmap *datapath_bindings,
 
 static void
 datapath_bindings_add_lport(struct hmap *datapath_bindings,
-                            struct uuid *dp_uuid, const char *lport)
+                            const struct sbrec_port_binding *pb)
 {
     if (!datapath_bindings) {
         return;
     }
 
     struct datapath_binding *b = datapath_bindings_find(datapath_bindings,
-                                                        dp_uuid);
+        &pb->datapath->header_.uuid);
     if (!b) {
-        b = datapath_bindings_create(datapath_bindings, dp_uuid);
+        b = datapath_bindings_create(datapath_bindings, pb->datapath);
     }
-    sset_add(&b->lports, lport);
+    struct dp_port *lport = xmalloc(sizeof *lport);
+    lport->pb = pb;
+    ovs_list_push_back(&b->lports_head, &lport->list_node);
 }
 
 void
@@ -649,7 +644,11 @@ datapath_bindings_destroy(struct hmap *datapath_bindings)
 {
     struct datapath_binding *b;
     HMAP_FOR_EACH_POP (b, node, datapath_bindings) {
-        sset_destroy(&b->lports);
+    struct dp_port *lport, *next;
+        LIST_FOR_EACH_SAFE (lport, next, list_node, &b->lports_head) {
+            ovs_list_remove(&lport->list_node);
+            free(lport);
+        }
         free(b);
     }
 
@@ -694,9 +693,7 @@ claim_lport(const struct sbrec_port_binding *pb,
         }
 
         if (updated_dp_bindings) {
-            datapath_bindings_add_lport(updated_dp_bindings,
-                                        &pb->datapath->header_.uuid,
-                                        pb->logical_port);
+            datapath_bindings_add_lport(updated_dp_bindings, pb);
         }
         sbrec_port_binding_set_chassis(pb, chassis_rec);
     }
@@ -724,9 +721,7 @@ release_lport(const struct sbrec_port_binding *pb,
     }
 
     if (deleted_dp_bindings) {
-        datapath_bindings_add_lport(deleted_dp_bindings,
-                                    &pb->datapath->header_.uuid,
-                                    pb->logical_port);
+        datapath_bindings_add_lport(deleted_dp_bindings, pb);
     }
 }
 
@@ -781,9 +776,7 @@ consider_port_binding_for_vif(const struct sbrec_port_binding *pb,
                                              pb, binding_type);
                 local_binding_add_child(lbinding, child);
                 if (b_ctx_out->updated_dp_bindings) {
-                    datapath_bindings_add_lport(b_ctx_out->updated_dp_bindings,
-                                                &pb->datapath->header_.uuid,
-                                                pb->logical_port);
+                    datapath_bindings_add_lport(b_ctx_out->updated_dp_bindings, pb);
                 }
             } else {
                 ovs_assert(child->type == BT_CHILD ||
