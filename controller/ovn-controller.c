@@ -83,6 +83,8 @@ static unixctl_cb_func engine_recompute_cmd;
 static char *parse_options(int argc, char *argv[]);
 OVS_NO_RETURN static void usage(void);
 
+bool _flow_output_resource_ref_handler(struct engine_node *, void *,
+                                  enum ref_type ref);
 /* Pending packet to be injected into connected OVS. */
 struct pending_pkt {
     /* Setting 'conn' indicates that a request is pending. */
@@ -753,6 +755,7 @@ enum sb_engine_node {
     OVS_NODE(open_vswitch, "open_vswitch") \
     OVS_NODE(bridge, "bridge") \
     OVS_NODE(port, "port") \
+    OVS_NODE(interface, "interface") \
     OVS_NODE(qos, "qos")
 
 enum ovs_engine_node {
@@ -954,6 +957,71 @@ port_groups_sb_port_group_handler(struct engine_node *node, void *data)
     return true;
 }
 
+struct ed_type_port_bindings{
+    bool change_tracked;
+    struct sset new;
+    struct sset deleted;
+    struct sset updated;
+};
+
+static void *
+en_port_bindings_init(struct engine_node *node OVS_UNUSED,
+                    struct engine_arg *arg OVS_UNUSED)
+{
+    struct ed_type_port_bindings *pb = xzalloc(sizeof *pb);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+
+    pb->change_tracked = false;
+    sset_init(&pb->new);
+    sset_init(&pb->deleted);
+    sset_init(&pb->updated);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    return pb;
+}
+
+static void
+en_port_bindings_cleanup(void *data)
+{
+    struct ed_type_port_bindings *pb = data;
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    sset_destroy(&pb->new);
+    sset_destroy(&pb->deleted);
+    sset_destroy(&pb->updated);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+}
+
+static void
+en_port_bindings_run(struct engine_node *node, void *data)
+{
+    struct ed_type_port_bindings *pb = data;
+
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    sset_clear(&pb->new);
+    sset_clear(&pb->deleted);
+    sset_clear(&pb->updated);
+
+    pb->change_tracked = false;
+    engine_set_node_state(node, EN_UPDATED);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+}
+
+static bool
+port_bindings_sb_port_binding_handler(struct engine_node *node, void *data)
+{
+    struct ed_type_port_bindings *pb = data;
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+
+    sset_clear(&pb->new);
+    sset_clear(&pb->deleted);
+    sset_clear(&pb->updated);
+
+    pb->change_tracked = false;
+    engine_set_node_state(node, EN_UPDATED);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    return true;
+}
+
+
 struct ed_type_runtime_data {
     /* Contains "struct local_datapath" nodes. */
     struct hmap local_datapaths;
@@ -969,6 +1037,7 @@ struct ed_type_runtime_data {
      * <datapath-tunnel-key>_<port-tunnel-key> */
     struct sset local_lport_ids;
     struct sset active_tunnels;
+    bool local_bindings_updated;
 };
 
 static void *
@@ -981,6 +1050,7 @@ en_runtime_data_init(struct engine_node *node OVS_UNUSED,
     sset_init(&data->local_lports);
     sset_init(&data->local_lport_ids);
     sset_init(&data->active_tunnels);
+    data->local_bindings_updated = false;
     return data;
 }
 
@@ -1000,10 +1070,13 @@ en_runtime_data_cleanup(void *data)
         free(cur_node);
     }
     hmap_destroy(&rt_data->local_datapaths);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    rt_data->local_bindings_updated = false;
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
 }
 
 static void
-en_runtime_data_run(struct engine_node *node, void *data)
+get_runtime_data(struct engine_node *node, void *data)
 {
     struct ed_type_runtime_data *rt_data = data;
     struct hmap *local_datapaths = &rt_data->local_datapaths;
@@ -1011,6 +1084,7 @@ en_runtime_data_run(struct engine_node *node, void *data)
     struct sset *local_lport_ids = &rt_data->local_lport_ids;
     struct sset *active_tunnels = &rt_data->active_tunnels;
 
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
     static bool first_run = true;
     if (first_run) {
         /* don't cleanup since there is no data yet */
@@ -1101,8 +1175,24 @@ en_runtime_data_run(struct engine_node *node, void *data)
                 active_tunnels, bridge_table,
                 ovs_table, local_datapaths,
                 local_lports, local_lport_ids);
-
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
     engine_set_node_state(node, EN_UPDATED);
+}
+
+static void
+en_runtime_data_run(struct engine_node *node, void *data) {
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    get_runtime_data(node, data);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    engine_set_node_state(node, EN_UPDATED);
+}
+
+static bool
+runtime_data_ovs_interface_handler(struct engine_node *node, void *data)
+{
+         get_runtime_data(node, data); 
+    engine_set_node_state(node, EN_UPDATED);
+         return true;
 }
 
 static bool
@@ -1111,6 +1201,7 @@ runtime_data_sb_port_binding_handler(struct engine_node *node, void *data)
     struct ed_type_runtime_data *rt_data = data;
     struct sset *local_lports = &rt_data->local_lports;
     struct sset *active_tunnels = &rt_data->active_tunnels;
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
 
     struct ovsrec_open_vswitch_table *ovs_table =
         (struct ovsrec_open_vswitch_table *)EN_OVSDB_GET(
@@ -1138,8 +1229,21 @@ runtime_data_sb_port_binding_handler(struct engine_node *node, void *data)
 
     bool changed = binding_evaluate_port_binding_changes(
         pb_table, br_int, chassis, active_tunnels, local_lports);
+    if (changed) { /*
+        if (!engine_get_context()->ovnsb_idl_txn) {
+    VLOG_INFO("ANIL ovnsb_idl_txn NULL %s:%d", __FUNCTION__, __LINE__);
+            return false;
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+        }
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+         get_runtime_data(node, data); */
+        rt_data->local_bindings_updated = true;
+        engine_set_node_state(node, EN_UPDATED);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    }
 
-    return !changed;
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    return true;
 }
 
 /* Connection tracking zones. */
@@ -1248,7 +1352,7 @@ static void init_physical_ctx(struct engine_node *node,
 {
     struct ovsdb_idl_index *sbrec_port_binding_by_name =
         engine_ovsdb_node_get_index(
-                engine_get_input("SB_port_binding", node),
+                engine_get_input("SB_port_binding", engine_get_input("port_bindings", node)),
                 "name");
 
     struct sbrec_multicast_group_table *multicast_group_table =
@@ -1257,7 +1361,7 @@ static void init_physical_ctx(struct engine_node *node,
 
     struct sbrec_port_binding_table *port_binding_table =
         (struct sbrec_port_binding_table *)EN_OVSDB_GET(
-            engine_get_input("SB_port_binding", node));
+            engine_get_input("SB_port_binding", engine_get_input("port_bindings", node)));
 
     struct sbrec_chassis_table *chassis_table =
         (struct sbrec_chassis_table *)EN_OVSDB_GET(
@@ -1310,8 +1414,8 @@ static void init_lflow_ctx(struct engine_node *node,
 {
     struct ovsdb_idl_index *sbrec_port_binding_by_name =
         engine_ovsdb_node_get_index(
-                engine_get_input("SB_port_binding", node),
-                "name");
+                engine_get_input("SB_port_binding",
+                   engine_get_input("port_bindings", node)), "name");
 
     struct ovsdb_idl_index *sbrec_mc_group_by_name_dp =
         engine_ovsdb_node_get_index(
@@ -1409,6 +1513,7 @@ en_flow_output_run(struct engine_node *node, void *data)
 {
     struct ed_type_runtime_data *rt_data =
         engine_get_input_data("runtime_data", node);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
 
     struct ovsrec_open_vswitch_table *ovs_table =
         (struct ovsrec_open_vswitch_table *)EN_OVSDB_GET(
@@ -1492,7 +1597,7 @@ flow_output_sb_mac_binding_handler(struct engine_node *node, void *data)
 {
     struct ovsdb_idl_index *sbrec_port_binding_by_name =
         engine_ovsdb_node_get_index(
-                engine_get_input("SB_port_binding", node),
+                engine_get_input("SB_port_binding", engine_get_input("port_bindings", node)),
                 "name");
 
     struct sbrec_mac_binding_table *mac_binding_table =
@@ -1514,68 +1619,83 @@ flow_output_sb_mac_binding_handler(struct engine_node *node, void *data)
 }
 
 static bool
+logical_handle_port_binding_changes(struct engine_node *node, void *data,
+                                    struct physical_ctx *p_ctx)
+{
+        /* ANIL */
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    bool ret = true;
+    struct ed_type_port_bindings *pb = 
+            engine_get_input_data("port_bindings", node);
+
+    const struct sbrec_port_binding *binding;
+    SBREC_PORT_BINDING_TABLE_FOR_EACH_TRACKED (binding,
+                                               p_ctx->port_binding_table) {
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+        char name[16];
+        snprintf(name, sizeof(name), "%"PRId64"_%"PRId64,
+                  (int64_t)binding->datapath->tunnel_key,
+                  (int64_t)binding->tunnel_key);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+
+        if (sbrec_port_binding_is_deleted(binding)) {
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+            sset_add(&pb->deleted, name);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+        } else {
+            if (!sbrec_port_binding_is_new(binding)) {
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+                sset_add(&pb->new, name);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+            }
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+            sset_add(&pb->updated, name);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+        }
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    }
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+
+    pb->change_tracked = true;
+
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    if (!sset_is_empty(&pb->new) || !sset_is_empty(&pb->deleted) ||
+            !sset_is_empty(&pb->updated)) {
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+        engine_set_node_state(node, EN_UPDATED);
+        ret = _flow_output_resource_ref_handler(node, data, REF_TYPE_PORTBINDING);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    } else {
+        engine_set_node_state(node, EN_VALID);
+    }
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    return ret;
+}
+
+static bool
 flow_output_sb_port_binding_handler(struct engine_node *node, void *data)
 {
     struct ed_type_runtime_data *rt_data =
         engine_get_input_data("runtime_data", node);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+
+    bool ret = true;
 
     struct ed_type_flow_output *fo = data;
     struct ovn_desired_flow_table *flow_table = &fo->flow_table;
 
-    /* XXX: now we handle port-binding changes for physical flow processing
-     * only, but port-binding change can have impact to logical flow
-     * processing, too, in below circumstances:
-     *
-     *  - When a port-binding for a lport is inserted/deleted but the lflow
-     *    using that lport doesn't change.
-     *
-     *    This can happen only when the lport name is used by ACL match
-     *    condition, which is specified by user. Even in that case, if the port
-     *    is actually bound on the current chassis it will trigger recompute on
-     *    that chassis since ovs interface would be updated. So the only
-     *    situation this would have real impact is when user defines an ACL
-     *    that includes lport that is not on current chassis, and there is a
-     *    port-binding creation/deletion related to that lport.e.g.: an ACL is
-     *    defined:
-     *
-     *    to-lport 1000 'outport=="A" && inport=="B"' allow-related
-     *
-     *    If "A" is on current chassis, but "B" is lport that hasn't been
-     *    created yet. When a lport "B" is created and bound on another
-     *    chassis, the ACL will not take effect on the current chassis until a
-     *    recompute is triggered later. This case doesn't seem to be a problem
-     *    for real world use cases because usually lport is created before
-     *    being referenced by name in ACLs.
-     *
-     *  - When is_chassis_resident(<lport>) is used in lflow. In this case the
-     *    port binding is not a regular VIF. It can be either "patch" or
-     *    "external", with ha-chassis-group assigned.  In current
-     *    "runtime_data" handling, port-binding changes for these types always
-     *    trigger recomputing. So it is fine even if we do not handle it here.
-     *    (due to the ovsdb tracking support for referenced table changes,
-     *    ha-chassis-group changes will appear as port-binding change).
-     *
-     *  - When a mac-binding doesn't change but the port-binding related to
-     *    that mac-binding is deleted. In this case the neighbor flow generated
-     *    for the mac-binding should be deleted. This would not cause any real
-     *    issue for now, since the port-binding related to mac-binding is
-     *    always logical router port, and any change to logical router port
-     *    would just trigger recompute.
-     *
-     * Although there is no correctness issue so far (except the unusual ACL
-     * use case, which doesn't seem to be a real problem), it might be better
-     * to handle this more gracefully, without the need to consider these
-     * tricky scenarios.  One approach is to maintain a mapping between lport
-     * names and the lflows that uses them, and reprocess the related lflows
-     * when related port-bindings change.
-     */
     struct physical_ctx p_ctx;
     init_physical_ctx(node, rt_data, &p_ctx);
 
     physical_handle_port_binding_changes(&p_ctx, flow_table);
+    if (rt_data->local_bindings_updated) {
+        ret = logical_handle_port_binding_changes(node, data, &p_ctx);
+        /*ANIL*/
+    }
 
     engine_set_node_state(node, EN_UPDATED);
-    return true;
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
+    return ret;
 }
 
 static bool
@@ -1597,18 +1717,22 @@ flow_output_sb_multicast_group_handler(struct engine_node *node, void *data)
 
 }
 
-static bool
+bool
 _flow_output_resource_ref_handler(struct engine_node *node, void *data,
                                   enum ref_type ref_type)
 {
     struct ed_type_runtime_data *rt_data =
         engine_get_input_data("runtime_data", node);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
 
     struct ed_type_addr_sets *as_data =
         engine_get_input_data("addr_sets", node);
 
     struct ed_type_port_groups *pg_data =
         engine_get_input_data("port_groups", node);
+
+    struct ed_type_port_bindings *pb_data =
+        engine_get_input_data("port_bindings", node);
 
     struct ovsrec_open_vswitch_table *ovs_table =
         (struct ovsrec_open_vswitch_table *)EN_OVSDB_GET(
@@ -1659,6 +1783,14 @@ _flow_output_resource_ref_handler(struct engine_node *node, void *data,
             updated = &pg_data->updated;
             deleted = &pg_data->deleted;
             break;
+        case REF_TYPE_PORTBINDING:
+            if (!pb_data->change_tracked) {
+                return false;
+            }
+            new = &pb_data->new;
+            updated = &pb_data->updated;
+            deleted = &pb_data->deleted;
+            break;
         default:
             OVS_NOT_REACHED();
     }
@@ -1692,6 +1824,7 @@ _flow_output_resource_ref_handler(struct engine_node *node, void *data,
         }
     }
 
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
     return true;
 }
 
@@ -1823,6 +1956,7 @@ main(int argc, char *argv[])
     update_sb_monitors(ovnsb_idl_loop.idl, NULL, NULL, NULL, false);
 
     stopwatch_create(CONTROLLER_LOOP_STOPWATCH_NAME, SW_MS);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
 
     /* Define inc-proc-engine nodes. */
     ENGINE_NODE_CUSTOM_DATA(ct_zones, "ct_zones");
@@ -1832,6 +1966,7 @@ main(int argc, char *argv[])
     ENGINE_NODE(flow_output, "flow_output");
     ENGINE_NODE(addr_sets, "addr_sets");
     ENGINE_NODE(port_groups, "port_groups");
+    ENGINE_NODE(port_bindings, "port_bindings");
 
 #define SB_NODE(NAME, NAME_STR) ENGINE_NODE_SB(NAME, NAME_STR);
     SB_NODES
@@ -1847,13 +1982,14 @@ main(int argc, char *argv[])
                      addr_sets_sb_address_set_handler);
     engine_add_input(&en_port_groups, &en_sb_port_group,
                      port_groups_sb_port_group_handler);
+    engine_add_input(&en_port_bindings, &en_sb_port_binding,
+                     port_bindings_sb_port_binding_handler);
 
     engine_add_input(&en_flow_output, &en_addr_sets,
                      flow_output_addr_sets_handler);
     engine_add_input(&en_flow_output, &en_port_groups,
                      flow_output_port_groups_handler);
     engine_add_input(&en_flow_output, &en_runtime_data, NULL);
-    engine_add_input(&en_flow_output, &en_ct_zones, NULL);
     engine_add_input(&en_flow_output, &en_mff_ovn_geneve, NULL);
 
     engine_add_input(&en_flow_output, &en_ovs_open_vswitch, NULL);
@@ -1863,7 +1999,7 @@ main(int argc, char *argv[])
     engine_add_input(&en_flow_output, &en_sb_encap, NULL);
     engine_add_input(&en_flow_output, &en_sb_multicast_group,
                      flow_output_sb_multicast_group_handler);
-    engine_add_input(&en_flow_output, &en_sb_port_binding,
+    engine_add_input(&en_flow_output, &en_port_bindings,
                      flow_output_sb_port_binding_handler);
     engine_add_input(&en_flow_output, &en_sb_mac_binding,
                      flow_output_sb_mac_binding_handler);
@@ -1881,13 +2017,14 @@ main(int argc, char *argv[])
 
     engine_add_input(&en_runtime_data, &en_ovs_open_vswitch, NULL);
     engine_add_input(&en_runtime_data, &en_ovs_bridge, NULL);
-    engine_add_input(&en_runtime_data, &en_ovs_port, NULL);
+    engine_add_input(&en_runtime_data, &en_ovs_interface, runtime_data_ovs_interface_handler);
     engine_add_input(&en_runtime_data, &en_ovs_qos, NULL);
 
     engine_add_input(&en_runtime_data, &en_sb_chassis, NULL);
     engine_add_input(&en_runtime_data, &en_sb_datapath_binding, NULL);
     engine_add_input(&en_runtime_data, &en_sb_port_binding,
                      runtime_data_sb_port_binding_handler);
+    VLOG_INFO("ANIL %s:%d", __FUNCTION__, __LINE__);
 
     struct engine_arg engine_arg = {
         .sb_idl = ovnsb_idl_loop.idl,

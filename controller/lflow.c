@@ -649,6 +649,8 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
                 int64_t dp_id = lflow->logical_datapath->tunnel_key;
                 char buf[16];
                 snprintf(buf, sizeof(buf), "%"PRId64"_%"PRId64, dp_id, port_id);
+                lflow_resource_add(l_ctx_out->lfrr, REF_TYPE_PORTBINDING, buf,
+                                   &lflow->header_.uuid);
                 if (!sset_contains(l_ctx_in->local_lport_ids, buf)) {
                     VLOG_DBG("lflow "UUID_FMT
                              " port %s in match is not local, skip",
