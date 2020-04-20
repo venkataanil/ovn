@@ -1412,7 +1412,7 @@ ofctrl_handler(void *data OVS_UNUSED)
     struct ofctrl_bufs *ofbufs;
     struct ovs_list *list;
     /* wait for 10 msec */
-    static long long int rc_wait_timeout = 10;
+    static long long int rc_wait_timeout = 100;
 
     for (;;) {
         ovs_mutex_lock(&ofctrl_msgs.mutex);
