@@ -21,6 +21,7 @@
 #include "flow.h"
 #include "hash.h"
 #include "hindex.h"
+#include "ovs-thread.h"
 #include "lflow.h"
 #include "ofctrl.h"
 #include "openflow/openflow.h"
@@ -40,16 +41,42 @@
 #include "openvswitch/ofpbuf.h"
 #include "openvswitch/vlog.h"
 #include "ovn-controller.h"
+#include "latch.h"
 #include "ovn/actions.h"
 #include "lib/extend-table.h"
 #include "openvswitch/poll-loop.h"
 #include "physical.h"
 #include "openvswitch/rconn.h"
 #include "socket-util.h"
+#include "seq.h"
 #include "util.h"
 #include "vswitch-idl.h"
 
 VLOG_DEFINE_THIS_MODULE(ofctrl);
+
+struct ofctrl {
+    pthread_t ofctrl_thread;
+    /* Latch to destroy the 'ofctrl_thread' */
+    struct latch ofctrl_thread_exit;
+};
+
+static struct ofctrl ofctrl;
+
+struct ofctrl_bufs {
+    struct ovs_list node;
+    struct ovs_list msgs;
+};
+
+struct ofctrl_msgs {
+    struct ovs_mutex mutex;
+    struct ovs_list list;
+    pthread_cond_t cond;
+};
+
+static struct ofctrl_msgs ofctrl_msgs = {
+    .mutex = OVS_MUTEX_INITIALIZER,
+    .list  = OVS_LIST_INITIALIZER(&ofctrl_msgs.list),
+};
 
 /* An OpenFlow flow. */
 struct ovn_flow {
@@ -69,6 +96,7 @@ struct ovn_flow {
     uint64_t cookie;
 };
 
+static void *ofctrl_handler(void *data);
 static struct ovn_flow *ovn_flow_alloc(uint8_t table_id, uint16_t priority,
                                        uint64_t cookie,
                                        const struct match *match,
@@ -185,6 +213,10 @@ ofctrl_init(struct ovn_extend_table *group_table,
     ovn_init_symtab(&symtab);
     groups = group_table;
     meters = meter_table;
+
+    latch_init(&ofctrl.ofctrl_thread_exit);
+    ofctrl.ofctrl_thread = ovs_thread_create("ovn_ofctrl", ofctrl_handler,
+                                                &ofctrl);
 }
 
 /* S_NEW, for a new connection.
@@ -595,6 +627,10 @@ ofctrl_wait(void)
 void
 ofctrl_destroy(void)
 {
+    latch_set(&ofctrl.ofctrl_thread_exit);
+    pthread_join(ofctrl.ofctrl_thread, NULL);
+    latch_destroy(&ofctrl.ofctrl_thread_exit);
+
     rconn_destroy(swconn);
     ovn_installed_flow_table_destroy();
     rconn_packet_counter_destroy(tx_counter);
@@ -667,14 +703,23 @@ ofctrl_check_and_add_flow(struct ovn_desired_flow_table *flow_table,
 
     ovn_flow_log(f, "ofctrl_add_flow");
 
-    if (ovn_flow_lookup(&flow_table->match_flow_table, f, true)) {
-        if (log_duplicate_flow) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 5);
-            if (!VLOG_DROP_DBG(&rl)) {
-                char *s = ovn_flow_to_string(f);
-                VLOG_DBG("dropping duplicate flow: %s", s);
-                free(s);
+    struct ovn_flow *existing_f =
+        ovn_flow_lookup(&flow_table->match_flow_table, f, true);
+    if (existing_f) {
+        if (ofpacts_equal(f->ofpacts, f->ofpacts_len,
+                          existing_f->ofpacts, existing_f->ofpacts_len)) {
+            if (log_duplicate_flow) {
+                static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 5);
+                if (!VLOG_DROP_DBG(&rl)) {
+                    char *s = ovn_flow_to_string(f);
+                    VLOG_DBG("dropping duplicate flow: %s", s);
+                    free(s);
+                }
             }
+        } else {
+            free(existing_f->ofpacts);
+            existing_f->ofpacts = xmemdup(f->ofpacts, f->ofpacts_len);
+            existing_f->ofpacts_len = f->ofpacts_len;
         }
         ovn_flow_destroy(f);
         return;
@@ -1044,7 +1089,6 @@ bool
 ofctrl_can_put(void)
 {
     if (state != S_UPDATE_FLOWS
-        || rconn_packet_counter_n_packets(tx_counter)
         || rconn_get_version(swconn) < 0) {
         return false;
     }
@@ -1101,14 +1145,17 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
     need_reinstall_flows = false;
 
     /* OpenFlow messages to send to the switch to bring it up-to-date. */
-    struct ovs_list msgs = OVS_LIST_INITIALIZER(&msgs);
+    struct ofctrl_bufs *ofbufs;
+
+    ofbufs = xmalloc(sizeof *ofbufs);
+    ovs_list_init(&ofbufs->msgs);
 
     /* Iterate through ct zones that need to be flushed. */
     struct shash_node *iter;
     SHASH_FOR_EACH(iter, pending_ct_zones) {
         struct ct_zone_pending_entry *ctzpe = iter->data;
         if (ctzpe->state == CT_ZONE_OF_QUEUED) {
-            add_ct_flush_zone(ctzpe->zone, &msgs);
+            add_ct_flush_zone(ctzpe->zone, &ofbufs->msgs);
             ctzpe->state = CT_ZONE_OF_SENT;
             ctzpe->of_xid = 0;
         }
@@ -1127,7 +1174,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
         char *error = parse_ofp_group_mod_str(&gm, OFPGC11_ADD, group_string,
                                               NULL, NULL, &usable_protocols);
         if (!error) {
-            add_group_mod(&gm, &msgs);
+            add_group_mod(&gm, &ofbufs->msgs);
         } else {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
             VLOG_ERR_RL(&rl, "new group %s %s", error, group_string);
@@ -1144,9 +1191,9 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
         if (!strncmp(m_desired->name, "__string: ", 10)) {
             /* The "set-meter" action creates a meter entry name that
              * describes the meter itself. */
-            add_meter_string(m_desired, &msgs);
+            add_meter_string(m_desired, &ofbufs->msgs);
         } else {
-            add_meter(m_desired, meter_table, &msgs);
+            add_meter(m_desired, meter_table, &ofbufs->msgs);
         }
     }
 
@@ -1166,7 +1213,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
                 .table_id = i->table_id,
                 .command = OFPFC_DELETE_STRICT,
             };
-            add_flow_mod(&fm, &msgs);
+            add_flow_mod(&fm, &ofbufs->msgs);
             ovn_flow_log(i, "removing installed");
 
             hmap_remove(&installed_flows, &i->match_hmap_node);
@@ -1196,7 +1243,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
                     fm.command = OFPFC_ADD,
                     i->cookie = d->cookie;
                 }
-                add_flow_mod(&fm, &msgs);
+                add_flow_mod(&fm, &ofbufs->msgs);
                 ovn_flow_log(i, "updating installed");
 
                 /* Replace 'i''s actions by 'd''s. */
@@ -1224,7 +1271,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
                 .new_cookie = htonll(d->cookie),
                 .command = OFPFC_ADD,
             };
-            add_flow_mod(&fm, &msgs);
+            add_flow_mod(&fm, &ofbufs->msgs);
             ovn_flow_log(d, "adding installed");
 
             /* Copy 'd' from 'flow_table' to installed_flows. */
@@ -1247,7 +1294,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
                                               group_string, NULL, NULL,
                                               &usable_protocols);
         if (!error) {
-            add_group_mod(&gm, &msgs);
+            add_group_mod(&gm, &ofbufs->msgs);
         } else {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
             VLOG_ERR_RL(&rl, "Error deleting group %d: %s",
@@ -1271,7 +1318,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
             .command = OFPMC13_DELETE,
             .meter = { .meter_id = m_installed->table_id },
         };
-        add_meter_mod(&mm, &msgs);
+        add_meter_mod(&mm, &ofbufs->msgs);
 
         ovn_extend_table_remove_existing(meters, m_installed);
     }
@@ -1279,17 +1326,29 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
     /* Sync the contents of meters->desired to meters->existing. */
     ovn_extend_table_sync(meters);
 
-    if (!ovs_list_is_empty(&msgs)) {
+    if (!ovs_list_is_empty(&ofbufs->msgs)) {
         /* Add a barrier to the list of messages. */
         struct ofpbuf *barrier = ofputil_encode_barrier_request(OFP13_VERSION);
         const struct ofp_header *oh = barrier->data;
         ovs_be32 xid_ = oh->xid;
-        ovs_list_push_back(&msgs, &barrier->list_node);
+        ovs_list_push_back(&ofbufs->msgs, &barrier->list_node);
 
+        bool locally_process_msgs = false;
         /* Queue the messages. */
-        struct ofpbuf *msg;
-        LIST_FOR_EACH_POP (msg, list_node, &msgs) {
-            queue_msg(msg);
+        ovs_mutex_lock(&ofctrl_msgs.mutex);
+        if (!ovs_list_is_empty(&ofctrl_msgs.list) || rconn_packet_counter_n_packets(tx_counter)) {
+            ovs_list_push_back(&ofctrl_msgs.list, &ofbufs->node);
+            xpthread_cond_signal(&ofctrl_msgs.cond);
+        } else {
+            locally_process_msgs = true;
+        }
+        ovs_mutex_unlock(&ofctrl_msgs.mutex);
+
+        if (locally_process_msgs) {
+            struct ofpbuf *msg;
+            LIST_FOR_EACH_POP (msg, list_node, &ofbufs->msgs) {
+                queue_msg(msg);
+            }
         }
 
         /* Store the barrier's xid with any newly sent ct flushes. */
@@ -1345,6 +1404,43 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
         /* We were completely up-to-date before and still are. */
         cur_cfg = nb_cfg;
     }
+}
+
+static void *
+ofctrl_handler(void *data OVS_UNUSED)
+{
+    struct ofctrl_bufs *ofbufs;
+    struct ovs_list *list;
+    /* wait for 10 msec */
+    static long long int rc_wait_timeout = 100;
+
+    for (;;) {
+        ovs_mutex_lock(&ofctrl_msgs.mutex);
+        if (ovs_list_is_empty(&ofctrl_msgs.list)) {
+            ovsrcu_quiesce_start();
+            ovs_mutex_cond_wait(&ofctrl_msgs.cond,
+                                &ofctrl_msgs.mutex);
+            ovsrcu_quiesce_end();
+        }
+        list = ovs_list_pop_front(&ofctrl_msgs.list);
+        ofbufs = CONTAINER_OF(list, struct ofctrl_bufs, node);
+        ovs_mutex_unlock(&ofctrl_msgs.mutex);
+
+        for (;;) {
+            if (!rconn_packet_counter_n_packets(tx_counter)) {
+                break;
+            }
+            poll_timer_wait(rc_wait_timeout);
+        }
+
+        /* Queue the messages. */
+        struct ofpbuf *msg;
+        LIST_FOR_EACH_POP (msg, list_node, &ofbufs->msgs) {
+            queue_msg(msg);
+        }
+    }
+    return NULL;
+
 }
 
 /* Looks up the logical port with the name 'port_name' in 'br_int_'.  If
