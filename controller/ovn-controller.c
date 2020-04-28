@@ -2460,6 +2460,10 @@ main(int argc, char *argv[])
             }
         }
 
+        if (ofctrl_put_skipped_last_time) {
+            poll_immediate_wake();
+        }
+
         ovsdb_idl_track_clear(ovnsb_idl_loop.idl);
         ovsdb_idl_track_clear(ovs_idl_loop.idl);
         poll_block();

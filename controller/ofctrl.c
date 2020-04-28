@@ -92,6 +92,10 @@ static struct shash symtab;
  * rconn_get_connection_seqno(rconn), 'swconn' has reconnected. */
 static unsigned int seqno;
 
+/* OpenFlow messages to send to the switch to bring it up-to-date. */
+static struct ovs_list ofpbuf_msgs = OVS_LIST_INITIALIZER(&ofpbuf_msgs);
+static bool skipped_last_time = false;
+
 /* Connection state machine. */
 #define STATES                                  \
     STATE(S_NEW)                                \
@@ -1053,12 +1057,18 @@ bool
 ofctrl_can_put(void)
 {
     if (state != S_UPDATE_FLOWS
-        || rconn_packet_counter_n_packets(tx_counter)
         || rconn_get_version(swconn) < 0) {
         return false;
     }
     return true;
 }
+
+bool
+ofctrl_put_skipped_last_time(void)
+{
+    return skipped_last_time;
+}
+
 
 /* Replaces the flow table on the switch, if possible, by the flows added
  * with ofctrl_add_flow().
@@ -1078,7 +1088,6 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
            int64_t nb_cfg,
            bool flow_changed)
 {
-    static bool skipped_last_time = false;
     static int64_t old_nb_cfg = 0;
     bool need_put = false;
     if (flow_changed || skipped_last_time || need_reinstall_flows) {
@@ -1095,29 +1104,19 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
     }
 
     old_nb_cfg = nb_cfg;
-
     if (!need_put) {
         VLOG_DBG("ofctrl_put not needed");
         return;
     }
-    if (!ofctrl_can_put()) {
-        VLOG_DBG("ofctrl_put can't be performed");
-        skipped_last_time = true;
-        return;
-    }
 
-    skipped_last_time = false;
     need_reinstall_flows = false;
-
-    /* OpenFlow messages to send to the switch to bring it up-to-date. */
-    struct ovs_list msgs = OVS_LIST_INITIALIZER(&msgs);
 
     /* Iterate through ct zones that need to be flushed. */
     struct shash_node *iter;
     SHASH_FOR_EACH(iter, pending_ct_zones) {
         struct ct_zone_pending_entry *ctzpe = iter->data;
         if (ctzpe->state == CT_ZONE_OF_QUEUED) {
-            add_ct_flush_zone(ctzpe->zone, &msgs);
+            add_ct_flush_zone(ctzpe->zone, &ofpbuf_msgs);
             ctzpe->state = CT_ZONE_OF_SENT;
             ctzpe->of_xid = 0;
         }
@@ -1136,7 +1135,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
         char *error = parse_ofp_group_mod_str(&gm, OFPGC11_ADD, group_string,
                                               NULL, NULL, &usable_protocols);
         if (!error) {
-            add_group_mod(&gm, &msgs);
+            add_group_mod(&gm, &ofpbuf_msgs);
         } else {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
             VLOG_ERR_RL(&rl, "new group %s %s", error, group_string);
@@ -1153,9 +1152,9 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
         if (!strncmp(m_desired->name, "__string: ", 10)) {
             /* The "set-meter" action creates a meter entry name that
              * describes the meter itself. */
-            add_meter_string(m_desired, &msgs);
+            add_meter_string(m_desired, &ofpbuf_msgs);
         } else {
-            add_meter(m_desired, meter_table, &msgs);
+            add_meter(m_desired, meter_table, &ofpbuf_msgs);
         }
     }
 
@@ -1175,7 +1174,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
                 .table_id = i->table_id,
                 .command = OFPFC_DELETE_STRICT,
             };
-            add_flow_mod(&fm, &msgs);
+            add_flow_mod(&fm, &ofpbuf_msgs);
             ovn_flow_log(i, "removing installed");
 
             hmap_remove(&installed_flows, &i->match_hmap_node);
@@ -1205,7 +1204,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
                     fm.command = OFPFC_ADD,
                     i->cookie = d->cookie;
                 }
-                add_flow_mod(&fm, &msgs);
+                add_flow_mod(&fm, &ofpbuf_msgs);
                 ovn_flow_log(i, "updating installed");
 
                 /* Replace 'i''s actions by 'd''s. */
@@ -1233,7 +1232,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
                 .new_cookie = htonll(d->cookie),
                 .command = OFPFC_ADD,
             };
-            add_flow_mod(&fm, &msgs);
+            add_flow_mod(&fm, &ofpbuf_msgs);
             ovn_flow_log(d, "adding installed");
 
             /* Copy 'd' from 'flow_table' to installed_flows. */
@@ -1256,7 +1255,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
                                               group_string, NULL, NULL,
                                               &usable_protocols);
         if (!error) {
-            add_group_mod(&gm, &msgs);
+            add_group_mod(&gm, &ofpbuf_msgs);
         } else {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
             VLOG_ERR_RL(&rl, "Error deleting group %d: %s",
@@ -1280,7 +1279,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
             .command = OFPMC13_DELETE,
             .meter = { .meter_id = m_installed->table_id },
         };
-        add_meter_mod(&mm, &msgs);
+        add_meter_mod(&mm, &ofpbuf_msgs);
 
         ovn_extend_table_remove_existing(meters, m_installed);
     }
@@ -1288,16 +1287,23 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
     /* Sync the contents of meters->desired to meters->existing. */
     ovn_extend_table_sync(meters);
 
-    if (!ovs_list_is_empty(&msgs)) {
+    if (!ofctrl_can_put() || rconn_packet_counter_n_packets(tx_counter)) {
+        VLOG_DBG("ofctrl_put can't be performed");
+        skipped_last_time = true;
+        return;
+    }
+    skipped_last_time = false;
+
+    if (!ovs_list_is_empty(&ofpbuf_msgs)) {
         /* Add a barrier to the list of messages. */
         struct ofpbuf *barrier = ofputil_encode_barrier_request(OFP13_VERSION);
         const struct ofp_header *oh = barrier->data;
         ovs_be32 xid_ = oh->xid;
-        ovs_list_push_back(&msgs, &barrier->list_node);
+        ovs_list_push_back(&ofpbuf_msgs, &barrier->list_node);
 
         /* Queue the messages. */
         struct ofpbuf *msg;
-        LIST_FOR_EACH_POP (msg, list_node, &msgs) {
+        LIST_FOR_EACH_POP (msg, list_node, &ofpbuf_msgs) {
             queue_msg(msg);
         }
 
