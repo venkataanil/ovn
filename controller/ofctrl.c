@@ -81,12 +81,22 @@ static struct ovn_flow *ovn_flow_lookup(struct hmap *flow_table,
 static char *ovn_flow_to_string(const struct ovn_flow *);
 static void ovn_flow_log(const struct ovn_flow *, const char *action);
 static void ovn_flow_destroy(struct ovn_flow *);
+static void remove_flow_from_list(struct ovs_list *, const struct ovn_flow *, bool);
 
 /* OpenFlow connection to the switch. */
 static struct rconn *swconn;
 
 /* Symbol table for OVN expressions. */
 static struct shash symtab;
+static void updated_and_deleted_flow_table_clear(void);
+
+static bool flow_compare_optimize = false;
+void
+ofctrl_flow_compare_optimize(bool optimize) {
+    flow_compare_optimize = optimize;
+}
+static struct ovs_list updated_flows;
+static struct ovs_list deleted_flows;
 
 /* Last seen sequence number for 'swconn'.  When this differs from
  * rconn_get_connection_seqno(rconn), 'swconn' has reconnected. */
@@ -181,6 +191,8 @@ ofctrl_init(struct ovn_extend_table *group_table,
                           DSCP_DEFAULT, 1 << OFP13_VERSION);
     tx_counter = rconn_packet_counter_create();
     hmap_init(&installed_flows);
+    ovs_list_init(&updated_flows);
+    ovs_list_init(&deleted_flows);
     ovs_list_init(&flow_updates);
     ovn_init_symtab(&symtab);
     groups = group_table;
@@ -391,6 +403,7 @@ run_S_CLEAR_FLOWS(void)
     VLOG_DBG("clearing all flows");
 
     need_reinstall_flows = true;
+    flow_compare_optimize = false;
     /* Send a flow_mod to delete all flows. */
     struct ofputil_flow_mod fm = {
         .table_id = OFPTT_ALL,
@@ -597,6 +610,7 @@ ofctrl_destroy(void)
 {
     rconn_destroy(swconn);
     ovn_installed_flow_table_destroy();
+    updated_and_deleted_flow_table_clear();
     rconn_packet_counter_destroy(tx_counter);
     expr_symtab_destroy(&symtab);
     shash_destroy(&symtab);
@@ -693,6 +707,9 @@ ofctrl_check_and_add_flow(struct ovn_desired_flow_table *flow_table,
                 f->match_hmap_node.hash);
     hindex_insert(&flow_table->uuid_flow_table, &f->uuid_hindex_node,
                   f->uuid_hindex_node.hash);
+    if (flow_compare_optimize) {
+        ovs_list_push_back(&updated_flows, &f->list_node);
+    }
 }
 
 /* Removes a bundles of flows from the flow table. */
@@ -709,6 +726,14 @@ ofctrl_remove_flows(struct ovn_desired_flow_table *flow_table,
             hmap_remove(&flow_table->match_flow_table,
                         &f->match_hmap_node);
             hindex_remove(&flow_table->uuid_flow_table, &f->uuid_hindex_node);
+            if (flow_compare_optimize) {
+                struct ovn_flow *d;
+                d = ovn_flow_lookup(&installed_flows, f, false);
+                if (d) {
+                    ovs_list_push_back(&deleted_flows, &d->list_node);
+                }
+                remove_flow_from_list(&updated_flows, f, false);
+            }
             ovn_flow_destroy(f);
         }
     }
@@ -763,6 +788,9 @@ ofctrl_add_or_append_flow(struct ovn_desired_flow_table *desired_flows,
                     f->match_hmap_node.hash);
         hindex_insert(&desired_flows->uuid_flow_table, &f->uuid_hindex_node,
                       f->uuid_hindex_node.hash);
+        if (flow_compare_optimize) {
+            ovs_list_push_back(&updated_flows, &f->list_node);
+        }
     }
 }
 
@@ -831,6 +859,24 @@ ovn_flow_lookup(struct hmap *flow_table, const struct ovn_flow *target,
     }
     return NULL;
 }
+
+static void
+remove_flow_from_list(struct ovs_list *flow_table, const struct ovn_flow *target,
+                bool cmp_sb_uuid)
+{
+    struct ovn_flow *f, *next;
+
+    LIST_FOR_EACH_SAFE (f, next, list_node, flow_table) {
+        if (f->table_id == target->table_id
+            && f->priority == target->priority
+            && minimatch_equal(&f->match, &target->match)) {
+            if (!cmp_sb_uuid || uuid_equals(&target->sb_uuid, &f->sb_uuid)) {
+                ovs_list_remove(&f->list_node);
+            }
+        }
+    }
+}
+
 
 static char *
 ovn_flow_to_string(const struct ovn_flow *f)
@@ -906,6 +952,17 @@ ovn_installed_flow_table_clear(void)
 }
 
 static void
+updated_and_deleted_flow_table_clear(void)
+{
+    struct ovn_flow *f;
+    LIST_FOR_EACH_POP (f, list_node, &updated_flows) {
+    }
+    LIST_FOR_EACH_POP (f, list_node, &deleted_flows) {
+    }
+}
+
+
+static void
 ovn_installed_flow_table_destroy(void)
 {
     ovn_installed_flow_table_clear();
@@ -979,7 +1036,7 @@ add_meter_string(struct ovn_extend_table_info *m_desired,
     enum ofputil_protocol usable_protocols;
     char *meter_string = xasprintf("meter=%"PRIu32",%s",
                                    m_desired->table_id,
-                                   &m_desired->name[52]);
+                                   &m_desired->name[9]);
     char *error = parse_ofp_meter_mod_str(&mm, meter_string, OFPMC13_ADD,
                                           &usable_protocols);
     if (!error) {
@@ -1060,6 +1117,216 @@ ofctrl_can_put(void)
     return true;
 }
 
+void
+ofctrl_optimize_comparison(struct ovn_desired_flow_table *flow_table,
+                           struct ovs_list *msgs)
+{
+    /* Iterate through all of the deleted flows.  If any of them are no
+     * longer desired, delete them; if any of them should have different
+     * actions, update them. */
+    struct ovn_flow *i;
+    LIST_FOR_EACH_POP (i, list_node, &deleted_flows) {
+        struct ovn_flow *d = ovn_flow_lookup(&flow_table->match_flow_table,
+                                             i, false);
+        if (!d) {
+            /* Installed flow is no longer desirable.  Delete it from the
+             * switch and from installed_flows. */
+            struct ofputil_flow_mod fm = {
+                .match = i->match,
+                .priority = i->priority,
+                .table_id = i->table_id,
+                .command = OFPFC_DELETE_STRICT,
+            };
+            add_flow_mod(&fm, msgs);
+            ovn_flow_log(i, "removing installed");
+
+            hmap_remove(&installed_flows, &i->match_hmap_node);
+            ovn_flow_destroy(i);
+        } else {
+            if (!uuid_equals(&i->sb_uuid, &d->sb_uuid)) {
+                /* Update installed flow's UUID. */
+                i->sb_uuid = d->sb_uuid;
+            }
+            if (!ofpacts_equal(i->ofpacts, i->ofpacts_len,
+                               d->ofpacts, d->ofpacts_len) ||
+                i->cookie != d->cookie) {
+                /* Update actions in installed flow. */
+                struct ofputil_flow_mod fm = {
+                    .match = i->match,
+                    .priority = i->priority,
+                    .table_id = i->table_id,
+                    .ofpacts = d->ofpacts,
+                    .ofpacts_len = d->ofpacts_len,
+                    .command = OFPFC_MODIFY_STRICT,
+                };
+                /* Update cookie if it is changed. */
+                if (i->cookie != d->cookie) {
+                    fm.modify_cookie = true;
+                    fm.new_cookie = htonll(d->cookie);
+                    /* Use OFPFC_ADD so that cookie can be updated. */
+                    fm.command = OFPFC_ADD,
+                    i->cookie = d->cookie;
+                }
+                add_flow_mod(&fm, msgs);
+                ovn_flow_log(i, "updating installed");
+
+                /* Replace 'i''s actions by 'd''s. */
+                free(i->ofpacts);
+                i->ofpacts = xmemdup(d->ofpacts, d->ofpacts_len);
+                i->ofpacts_len = d->ofpacts_len;
+            }
+        }
+    }
+
+    /* Iterate through the updated flows and add those that aren't found
+     * in the installed flow table. */
+    struct ovn_flow *d;
+    LIST_FOR_EACH_POP (d, list_node, &updated_flows) {
+        i = ovn_flow_lookup(&installed_flows, d, false);
+        if (!i) {
+            /* Send flow_mod to add flow. */
+            struct ofputil_flow_mod fm = {
+                .match = d->match,
+                .priority = d->priority,
+                .table_id = d->table_id,
+                .ofpacts = d->ofpacts,
+                .ofpacts_len = d->ofpacts_len,
+                .new_cookie = htonll(d->cookie),
+                .command = OFPFC_ADD,
+            };
+            add_flow_mod(&fm, msgs);
+            ovn_flow_log(d, "adding installed");
+
+            /* Copy 'd' from 'flow_table' to installed_flows. */
+            struct ovn_flow *new_node = ofctrl_dup_flow(d);
+            hmap_insert(&installed_flows, &new_node->match_hmap_node,
+                        new_node->match_hmap_node.hash);
+        } else {
+            if (!uuid_equals(&i->sb_uuid, &d->sb_uuid)) {
+                /* Update installed flow's UUID. */
+                i->sb_uuid = d->sb_uuid;
+            }
+            if (!ofpacts_equal(i->ofpacts, i->ofpacts_len,
+                               d->ofpacts, d->ofpacts_len) ||
+                i->cookie != d->cookie) {
+                /* Update actions in installed flow. */
+                struct ofputil_flow_mod fm = {
+                    .match = i->match,
+                    .priority = i->priority,
+                    .table_id = i->table_id,
+                    .ofpacts = d->ofpacts,
+                    .ofpacts_len = d->ofpacts_len,
+                    .command = OFPFC_MODIFY_STRICT,
+                };
+                /* Update cookie if it is changed. */
+                if (i->cookie != d->cookie) {
+                    fm.modify_cookie = true;
+                    fm.new_cookie = htonll(d->cookie);
+                    /* Use OFPFC_ADD so that cookie can be updated. */
+                    fm.command = OFPFC_ADD,
+                    i->cookie = d->cookie;
+                }
+                add_flow_mod(&fm, msgs);
+                ovn_flow_log(i, "updating installed");
+
+                /* Replace 'i''s actions by 'd''s. */
+                free(i->ofpacts);
+                i->ofpacts = xmemdup(d->ofpacts, d->ofpacts_len);
+                i->ofpacts_len = d->ofpacts_len;
+            }
+        }
+    }
+}
+
+void
+ofctrl_compare_desired_and_installed_flows(struct ovn_desired_flow_table *flow_table,
+                                           struct ovs_list *msgs)
+{
+    /* Iterate through all of the installed flows.  If any of them are no
+     * longer desired, delete them; if any of them should have different
+     * actions, update them. */
+    struct ovn_flow *i, *next;
+    HMAP_FOR_EACH_SAFE (i, next, match_hmap_node, &installed_flows) {
+        struct ovn_flow *d = ovn_flow_lookup(&flow_table->match_flow_table,
+                                             i, false);
+        if (!d) {
+            /* Installed flow is no longer desirable.  Delete it from the
+             * switch and from installed_flows. */
+            struct ofputil_flow_mod fm = {
+                .match = i->match,
+                .priority = i->priority,
+                .table_id = i->table_id,
+                .command = OFPFC_DELETE_STRICT,
+            };
+            add_flow_mod(&fm, msgs);
+            ovn_flow_log(i, "removing installed");
+
+            hmap_remove(&installed_flows, &i->match_hmap_node);
+            ovn_flow_destroy(i);
+        } else {
+            if (!uuid_equals(&i->sb_uuid, &d->sb_uuid)) {
+                /* Update installed flow's UUID. */
+                i->sb_uuid = d->sb_uuid;
+            }
+            if (!ofpacts_equal(i->ofpacts, i->ofpacts_len,
+                               d->ofpacts, d->ofpacts_len) ||
+                i->cookie != d->cookie) {
+                /* Update actions in installed flow. */
+                struct ofputil_flow_mod fm = {
+                    .match = i->match,
+                    .priority = i->priority,
+                    .table_id = i->table_id,
+                    .ofpacts = d->ofpacts,
+                    .ofpacts_len = d->ofpacts_len,
+                    .command = OFPFC_MODIFY_STRICT,
+                };
+                /* Update cookie if it is changed. */
+                if (i->cookie != d->cookie) {
+                    fm.modify_cookie = true;
+                    fm.new_cookie = htonll(d->cookie);
+                    /* Use OFPFC_ADD so that cookie can be updated. */
+                    fm.command = OFPFC_ADD,
+                    i->cookie = d->cookie;
+                }
+                add_flow_mod(&fm, msgs);
+                ovn_flow_log(i, "updating installed");
+
+                /* Replace 'i''s actions by 'd''s. */
+                free(i->ofpacts);
+                i->ofpacts = xmemdup(d->ofpacts, d->ofpacts_len);
+                i->ofpacts_len = d->ofpacts_len;
+            }
+
+        }
+    }
+
+    /* Iterate through the desired flows and add those that aren't found
+     * in the installed flow table. */
+    struct ovn_flow *d;
+    HMAP_FOR_EACH (d, match_hmap_node, &flow_table->match_flow_table) {
+        i = ovn_flow_lookup(&installed_flows, d, false);
+        if (!i) {
+            /* Send flow_mod to add flow. */
+            struct ofputil_flow_mod fm = {
+                .match = d->match,
+                .priority = d->priority,
+                .table_id = d->table_id,
+                .ofpacts = d->ofpacts,
+                .ofpacts_len = d->ofpacts_len,
+                .new_cookie = htonll(d->cookie),
+                .command = OFPFC_ADD,
+            };
+            add_flow_mod(&fm, msgs);
+            ovn_flow_log(d, "adding installed");
+
+            /* Copy 'd' from 'flow_table' to installed_flows. */
+            struct ovn_flow *new_node = ofctrl_dup_flow(d);
+            hmap_insert(&installed_flows, &new_node->match_hmap_node,
+                        new_node->match_hmap_node.hash);
+        }
+    }
+}
+
 /* Replaces the flow table on the switch, if possible, by the flows added
  * with ofctrl_add_flow().
  *
@@ -1091,6 +1358,7 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
             cur_cfg = nb_cfg;
         } else {
             need_put = true;
+            flow_compare_optimize = false;
         }
     }
 
@@ -1103,7 +1371,11 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
     if (!ofctrl_can_put()) {
         VLOG_DBG("ofctrl_put can't be performed");
         skipped_last_time = true;
+        flow_compare_optimize = false;
         return;
+    }
+    if (skipped_last_time || need_reinstall_flows) {
+        flow_compare_optimize = false;
     }
 
     skipped_last_time = false;
@@ -1159,89 +1431,14 @@ ofctrl_put(struct ovn_desired_flow_table *flow_table,
         }
     }
 
-    /* Iterate through all of the installed flows.  If any of them are no
-     * longer desired, delete them; if any of them should have different
-     * actions, update them. */
-    struct ovn_flow *i, *next;
-    HMAP_FOR_EACH_SAFE (i, next, match_hmap_node, &installed_flows) {
-        struct ovn_flow *d = ovn_flow_lookup(&flow_table->match_flow_table,
-                                             i, false);
-        if (!d) {
-            /* Installed flow is no longer desirable.  Delete it from the
-             * switch and from installed_flows. */
-            struct ofputil_flow_mod fm = {
-                .match = i->match,
-                .priority = i->priority,
-                .table_id = i->table_id,
-                .command = OFPFC_DELETE_STRICT,
-            };
-            add_flow_mod(&fm, &msgs);
-            ovn_flow_log(i, "removing installed");
-
-            hmap_remove(&installed_flows, &i->match_hmap_node);
-            ovn_flow_destroy(i);
-        } else {
-            if (!uuid_equals(&i->sb_uuid, &d->sb_uuid)) {
-                /* Update installed flow's UUID. */
-                i->sb_uuid = d->sb_uuid;
-            }
-            if (!ofpacts_equal(i->ofpacts, i->ofpacts_len,
-                               d->ofpacts, d->ofpacts_len) ||
-                i->cookie != d->cookie) {
-                /* Update actions in installed flow. */
-                struct ofputil_flow_mod fm = {
-                    .match = i->match,
-                    .priority = i->priority,
-                    .table_id = i->table_id,
-                    .ofpacts = d->ofpacts,
-                    .ofpacts_len = d->ofpacts_len,
-                    .command = OFPFC_MODIFY_STRICT,
-                };
-                /* Update cookie if it is changed. */
-                if (i->cookie != d->cookie) {
-                    fm.modify_cookie = true;
-                    fm.new_cookie = htonll(d->cookie);
-                    /* Use OFPFC_ADD so that cookie can be updated. */
-                    fm.command = OFPFC_ADD,
-                    i->cookie = d->cookie;
-                }
-                add_flow_mod(&fm, &msgs);
-                ovn_flow_log(i, "updating installed");
-
-                /* Replace 'i''s actions by 'd''s. */
-                free(i->ofpacts);
-                i->ofpacts = xmemdup(d->ofpacts, d->ofpacts_len);
-                i->ofpacts_len = d->ofpacts_len;
-            }
-
-        }
+    if (flow_compare_optimize) {
+        ofctrl_optimize_comparison(flow_table, &msgs);
+    } else {
+        updated_and_deleted_flow_table_clear();
+        ofctrl_compare_desired_and_installed_flows(flow_table, &msgs);
     }
-
-    /* Iterate through the desired flows and add those that aren't found
-     * in the installed flow table. */
-    struct ovn_flow *d;
-    HMAP_FOR_EACH (d, match_hmap_node, &flow_table->match_flow_table) {
-        i = ovn_flow_lookup(&installed_flows, d, false);
-        if (!i) {
-            /* Send flow_mod to add flow. */
-            struct ofputil_flow_mod fm = {
-                .match = d->match,
-                .priority = d->priority,
-                .table_id = d->table_id,
-                .ofpacts = d->ofpacts,
-                .ofpacts_len = d->ofpacts_len,
-                .new_cookie = htonll(d->cookie),
-                .command = OFPFC_ADD,
-            };
-            add_flow_mod(&fm, &msgs);
-            ovn_flow_log(d, "adding installed");
-
-            /* Copy 'd' from 'flow_table' to installed_flows. */
-            struct ovn_flow *new_node = ofctrl_dup_flow(d);
-            hmap_insert(&installed_flows, &new_node->match_hmap_node,
-                        new_node->match_hmap_node.hash);
-        }
-    }
+    flow_compare_optimize = true;
+    updated_and_deleted_flow_table_clear();
 
     /* Iterate through the installed groups from previous runs. If they
      * are not needed delete them. */

@@ -1583,6 +1583,7 @@ en_flow_output_run(struct engine_node *node, void *data)
         ovn_extend_table_clear(meter_table, false /* desired */);
         lflow_resource_clear(lfrr);
     }
+    ofctrl_flow_compare_optimize(false);
 
     *conj_id_ofs = 1;
     struct lflow_ctx_in l_ctx_in;
@@ -2405,6 +2406,9 @@ main(int argc, char *argv[])
                 }
             }
 
+            if (engine_get_force_recompute()) {
+                ofctrl_flow_compare_optimize(false);
+            }
 
             if (pending_pkt.conn) {
                 struct ed_type_addr_sets *as_data =

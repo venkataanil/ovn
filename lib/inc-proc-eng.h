@@ -213,6 +213,7 @@ void engine_add_input(struct engine_node *node, struct engine_node *input,
  * when there is change but the engine couldn't be executed in that
  * iteration, and the change can't be tracked across iterations */
 void engine_set_force_recompute(bool val);
+bool engine_get_force_recompute(void);
 
 /* Return the current engine_context. The values in the context can be NULL
  * if the engine is run with allow_recompute == false in the current

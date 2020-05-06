@@ -837,6 +837,7 @@ lflow_run(struct lflow_ctx_in *l_ctx_in, struct lflow_ctx_out *l_ctx_out)
 {
     COVERAGE_INC(lflow_run);
 
+    ofctrl_flow_compare_optimize(false);
     add_logical_flows(l_ctx_in, l_ctx_out);
     add_neighbor_flows(l_ctx_in->sbrec_port_binding_by_name,
                        l_ctx_in->mac_binding_table, l_ctx_in->local_datapaths,

@@ -1448,6 +1448,7 @@ physical_run(struct physical_ctx *p_ctx,
         hc_uuid = xmalloc(sizeof(struct uuid));
         uuid_generate(hc_uuid);
     }
+    ofctrl_flow_compare_optimize(false);
 
     /* This bool tracks physical mapping changes. */
     bool physical_map_changed = false;

@@ -50,6 +50,12 @@ engine_set_force_recompute(bool val)
     engine_force_recompute = val;
 }
 
+bool
+engine_get_force_recompute(void)
+{
+    return engine_force_recompute;
+}
+
 const struct engine_context *
 engine_get_context(void)
 {
