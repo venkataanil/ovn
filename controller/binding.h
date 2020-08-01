@@ -134,4 +134,6 @@ bool binding_handle_ovs_interface_changes(struct binding_ctx_in *,
 bool binding_handle_port_binding_changes(struct binding_ctx_in *,
                                          struct binding_ctx_out *);
 void binding_tracked_dp_destroy(struct hmap *tracked_datapaths);
+struct tracked_binding_datapath *tracked_binding_datapath_find(
+    struct hmap *, const struct sbrec_datapath_binding *);
 #endif /* controller/binding.h */

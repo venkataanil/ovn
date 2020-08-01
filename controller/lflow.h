@@ -78,6 +78,12 @@ enum ref_type {
     REF_TYPE_PORTBINDING
 };
 
+enum ref_op {
+    REF_OP_ADDED,
+    REF_OP_DELETED,    
+    REF_OP_UPDATED    
+};
+
 /* Maintains the relationship for a pair of named resource and
  * a lflow, indexed by both ref_lflow_table and lflow_ref_table. */
 struct lflow_ref_list_node {
@@ -134,6 +140,11 @@ struct lflow_ctx_in {
     const struct shash *port_groups;
     const struct sset *active_tunnels;
     const struct sset *local_lport_ids;
+    struct hmap *tracked_dp_bindings;
+    struct shash *port_group_members_added;
+    struct shash *port_group_members_deleted;
+    struct shash *address_set_members_added;
+    struct shash *address_set_members_deleted;
 };
 
 struct lflow_ctx_out {
@@ -150,7 +161,10 @@ void lflow_run(struct lflow_ctx_in *, struct lflow_ctx_out *);
 bool lflow_handle_changed_flows(struct lflow_ctx_in *, struct lflow_ctx_out *);
 bool lflow_handle_changed_ref(enum ref_type, const char *ref_name,
                               struct lflow_ctx_in *, struct lflow_ctx_out *,
-                              bool *changed);
+                              bool *changed, enum ref_op);
+bool lflow_handle_ref_member_updates(enum ref_type, const char *ref_name,
+                         struct lflow_ctx_in *, struct lflow_ctx_out *,
+                         bool *changed, bool added, const struct shash *);
 void lflow_handle_changed_neighbors(
     struct ovsdb_idl_index *sbrec_port_binding_by_name,
     const struct sbrec_mac_binding_table *,

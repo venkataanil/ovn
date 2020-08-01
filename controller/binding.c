@@ -72,8 +72,6 @@ binding_register_ovs_idl(struct ovsdb_idl *ovs_idl)
 static struct tracked_binding_datapath *tracked_binding_datapath_create(
     const struct sbrec_datapath_binding *,
     bool is_new, struct hmap *tracked_dps);
-static struct tracked_binding_datapath *tracked_binding_datapath_find(
-    struct hmap *, const struct sbrec_datapath_binding *);
 static void tracked_binding_datapath_lport_add(
     const struct sbrec_port_binding *, struct hmap *tracked_datapaths);
 static void update_lport_tracking(const struct sbrec_port_binding *pb,
@@ -722,7 +720,7 @@ tracked_binding_datapath_create(const struct sbrec_datapath_binding *dp,
     return t_dp;
 }
 
-static struct tracked_binding_datapath *
+struct tracked_binding_datapath *
 tracked_binding_datapath_find(struct hmap *tracked_datapaths,
                               const struct sbrec_datapath_binding *dp)
 {
