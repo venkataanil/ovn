@@ -374,72 +374,258 @@ get_ovs_chassis_id(const struct ovsrec_open_vswitch_table *ovs_table)
  * corresponding symtab entries as necessary. */
 static void
 addr_sets_init(const struct sbrec_address_set_table *address_set_table,
-               struct shash *addr_sets)
+               struct shash *addr_sets, sturct shash *members)
 {
     const struct sbrec_address_set *as;
     SBREC_ADDRESS_SET_TABLE_FOR_EACH (as, address_set_table) {
         expr_const_sets_add(addr_sets, as->name,
                             (const char *const *) as->addresses,
                             as->n_addresses, true);
+        struct sset *new_addresses = xmalloc(sizeof *new_addresses);
+        for (int i=0; i<as->n_addresses; i++) {
+            sset_add(new_addresses, as->addresses[i]);
+        }
+        shash_add(members, as->name, new_addresses);
     }
+}
+
+/* ANIL fix*/
+static void
+addr_set_member_update(struct ed_type_addr_sets *as_data, const char *as_name,
+                         const char *const *as_addresses, size_t as_n_addresses)
+{   
+    int count;    
+
+    struct sset deleted = SSET_INITIALIZER(&deleted);
+    struct sset added = SSET_INITIALIZER(&added);
+
+    struct sset *members =
+        shash_find_data(&as_data->members, as_name);
+    if (members) {                
+        SSET_FOR_EACH(address, members) {                                        
+            for (count=0; count<as_n_addresses; count++) {
+                if (!strcmp(address, as_addresses[count])) {
+                    break;
+                }
+            }
+                        
+            if (count == as_n_addresses) {
+                if (sset_find_and_delete(members, address)) {
+                    sset_add(&deleted, address);                       
+                }
+            }
+        }
+        
+        /* Add new addresses */
+        for (count=0; count<as_n_addresses; count++) {
+            if (!sset_find(members, as_addresses[count])) {                               
+                sset_add(members, as_addresses[count]);
+                sset_add(&added, as_addresses[count]);                                                         
+            }
+        }
+        if (sset_is_empty(members)) {
+            shash_find_and_delete(&as_data->members, as_name);
+            sset_destroy(members);
+            free(members);
+        }
+    } else {
+            /* Add new addreses */            
+            for (count=0; count<as_n_addresses; count++) {
+                sset_add(&added, as_addresses[count]);
+            }
+
+            struct sset *new_addresses = xmalloc(sizeof *new_addresses);
+            sset_clone(new_addresses,  &added);
+            shash_add(&as_data->members, as_name, new_addresses);
+    }
+
+    int num_deleted = sset_count(&deleted);
+    int num_added = sset_count(&added);
+
+    if (num_added) {
+        const char **added_arr = sset_array(&added);
+        expr_const_sets_add(&as_data->members_added_cs, as_name,
+                    (const char *const *) added_arr,
+                    num_added, true);
+        free(added_arr);
+    }
+
+    if (num_deleted) {
+        const char **deleted_arr = sset_array(&deleted);
+        expr_const_sets_add(&as_data->members_deleted_cs, as_name,
+                    (const char *const *) deleted_arr,
+                    num_deleted, true);
+        free(deleted_arr);
+    }             
+    sset_destroy(&deleted);
+    sset_destroy(&added);
 }
 
 static void
 addr_sets_update(const struct sbrec_address_set_table *address_set_table,
-                 struct shash *addr_sets, struct sset *new,
-                 struct sset *deleted, struct sset *updated)
+                 struct ed_type_addr_sets *as_data);
 {
     const struct sbrec_address_set *as;
     SBREC_ADDRESS_SET_TABLE_FOR_EACH_TRACKED (as, address_set_table) {
         if (sbrec_address_set_is_deleted(as)) {
             expr_const_sets_remove(addr_sets, as->name);
-            sset_add(deleted, as->name);
+            sset_add(&as_data->deleted, as->name);
         } else {
-            expr_const_sets_add(addr_sets, as->name,
+            expr_const_sets_add(&as_data->addr_sets, as->name,
                                 (const char *const *) as->addresses,
                                 as->n_addresses, true);
             if (sbrec_address_set_is_new(as)) {
-                sset_add(new, as->name);
+                sset_add(&as_data->new, as->name);
             } else {
-                sset_add(updated, as->name);
+                sset_add(&as_data->updated, as->name);
             }
+            addr_set_member_update(as_data, as->name,
+                                   (const char *const *) as->addresses,
+                                   as->n_addresses);
         }
     }
 }
 
+/* ANIL fix1*/
 /* Iterate port groups in the southbound database.  Create and update the
  * corresponding symtab entries as necessary. */
  static void
 port_groups_init(const struct sbrec_port_group_table *port_group_table,
-                 struct shash *port_groups)
+                struct ed_type_port_groups *pg_data, struct sset *local_lports)                 
 {
     const struct sbrec_port_group *pg;
     SBREC_PORT_GROUP_TABLE_FOR_EACH (pg, port_group_table) {
-        expr_const_sets_add(port_groups, pg->name,
-                            (const char *const *) pg->ports,
-                            pg->n_ports, false);
+        struct sset new_ports = SSET_INITIALIZER(&new_ports);
+        for (int i=0; i<pg->n_ports; i++) {
+            if (sset_find(local_lports, pg->ports[i])) {                                
+                sset_add(new_ports, pg->ports[i]);              
+            }
+        }
+        int new_ports_count = sset_count(&new_ports);
+        if (new_ports_count) {
+            const char **added_arr = sset_array(new_ports);
+            expr_const_sets_add(&pg_data->port_groups_cs, pg->name,
+                                (const char *const *) added_arr,
+                                new_ports_count, false);
+            free(added_arr);   
+            initialise_port_group_members(&pg_data->members_updated,
+                                          pg->name, &new_ports);
+        }        
+        sset_destroy(&new_ports);
+    }
+}
+
+/* ANIL Fix this function*/
+static void
+port_group_member_update(struct ed_type_port_groups *pg_data, const char *pg_name,
+                         const char *const *pg_ports, size_t pg_n_ports,
+                         struct sset *local_lports)
+{   
+    int count;
+
+    struct port_group_members *members =
+        shash_find_data(&pg_data->members_updated, pg_name);
+    if (members) {
+        /* Prepare deleted ports if port got removed from PG or Chassis*/
+        SSET_FOR_EACH(port, &members->ports) {                                        
+            /* Port removed from chassis*/
+            if (!sset_find(local_lports, port)) {
+                sset_add(&members->deleted, port);                
+                sset_find_and_delete(&members->ports, port)
+                continue;
+            }
+
+            /* Local port removed from PG */
+            for (count=0; count<pg_n_ports; count++) {
+                if (!strcmp(port, pg_ports[count])) {
+                    break;
+                }
+            }
+                        
+            if (count == pg_n_ports) {
+                if (sset_find_and_delete(&members->ports, port)) {
+                    sset_add(&members->deleted, port);                       
+                }
+            }
+        }
+
+        /* Add new ports */
+        for (count=0; count<pg_n_ports; count++) {
+            if (!sset_find(&members->ports, pg_ports[count])) {
+                /* Add if it is a localport */
+                if (sset_find(local_lports, pg_ports[count])) {
+                    sset_add(&members->ports, pg_ports[count]);
+                    sset_add(&members->added, pg_ports[count]);                         
+                }                
+            }
+        }
+    } else {
+        /* Add new ports */
+            struct sset new_ports = SSET_INITIALIZER(&new_ports);
+            for (count=0; count<pg_n_ports; count++) {
+                if (sset_find(local_lports, pg_ports[count])) {                                
+                    sset_add(new_ports, pg_ports[count]);              
+                }
+            }
+            int new_ports_count = sset_count(&new_ports);
+            if (new_ports_count) {
+                initialise_port_group_members(&pg_data->members_updated,
+                                              pg_name, &new_ports);
+                sset_clone(&members->added,  &members->ports);
+            }        
+            sset_destroy(&new_ports);     
+    }
+    
+    members = shash_find_data(&pg_data->members_updated, pg_name);
+    if (members) {
+        int deleted = sset_count(&members->deleted);
+        int added = sset_count(&members->added);
+
+        if (added) {
+            const char **added_arr = sset_array(&members->added);
+            expr_const_sets_add(&pg_data->members_added_cs, pg_name,
+                        (const char *const *) added_arr,
+                        added, false);
+            free(added_arr);
+        }
+
+        if (deleted) {
+            const char **deleted_arr = sset_array(&members->deleted);
+            expr_const_sets_add(&pg_data->members_deleted_cs, pg_name,
+                        (const char *const *) deleted_arr,
+                        deleted, false);
+            free(deleted_arr);
+        } 
+
+        if (added || deleted) {
+            const char **added_arr = sset_array(&members->ports);
+            expr_const_sets_add(&pg_data->port_groups_cs, pg_name,
+                        (const char *const *) added_arr,
+                        sset_count(&members->ports), false);
+            free(added_arr);            
+        }          
     }
 }
 
 static void
 port_groups_update(const struct sbrec_port_group_table *port_group_table,
-                   struct shash *port_groups, struct sset *new,
-                   struct sset *deleted, struct sset *updated)
+                   struct ed_type_port_groups *pg_data,
+                   struct sset *local_lports)
 {
     const struct sbrec_port_group *pg;
     SBREC_PORT_GROUP_TABLE_FOR_EACH_TRACKED (pg, port_group_table) {
         if (sbrec_port_group_is_deleted(pg)) {
             expr_const_sets_remove(port_groups, pg->name);
-            sset_add(deleted, pg->name);
-        } else {
-            expr_const_sets_add(port_groups, pg->name,
-                                (const char *const *) pg->ports,
-                                pg->n_ports, false);
+            sset_add(&pg_data->deleted, pg->name);
+        } else {               
             if (sbrec_port_group_is_new(pg)) {
-                sset_add(new, pg->name);
+                sset_add(&pg_data->new, pg->name);
             } else {
-                sset_add(updated, pg->name);
+                sset_add(&pg_data->updated, pg->name);
             }
+            port_group_member_update(pg_data, pg->name, pg->ports,
+                                     pg->n_ports, local_lports); 
+            pg_data->tracked = true;           
         }
     }
 }
@@ -826,10 +1012,13 @@ en_ofctrl_is_connected_run(struct engine_node *node, void *data)
 
 struct ed_type_addr_sets {
     struct shash addr_sets;
+    struct shash members_added;
+    struct shash members_deleted;
     bool change_tracked;
     struct sset new;
     struct sset deleted;
     struct sset updated;
+    struct shash members:
 };
 
 static void *
@@ -839,10 +1028,14 @@ en_addr_sets_init(struct engine_node *node OVS_UNUSED,
     struct ed_type_addr_sets *as = xzalloc(sizeof *as);
 
     shash_init(&as->addr_sets);
+    shash_init(&as->members_added);
+    shash_init(&as->members_deleted);
+    shash_init(&as->members);
     as->change_tracked = false;
     sset_init(&as->new);
     sset_init(&as->deleted);
     sset_init(&as->updated);
+
     return as;
 }
 
@@ -851,10 +1044,21 @@ en_addr_sets_cleanup(void *data)
 {
     struct ed_type_addr_sets *as = data;
     expr_const_sets_destroy(&as->addr_sets);
+    expr_const_sets_destroy(&as->members_added);
+    expr_const_sets_destroy(&as->members_deleted);
+    shash_destroy(&as->members_added);
+    shash_destroy(&as->members_deleted);
     shash_destroy(&as->addr_sets);
     sset_destroy(&as->new);
     sset_destroy(&as->deleted);
     sset_destroy(&as->updated);
+
+    struct shash_node *node, *next;
+    SHASH_FOR_EACH_SAFE (node, next, &as->members) {        
+        sset_destroy(node->data);
+        free(node->data);
+        shash_delete(&as->members, node);        
+    }    
 }
 
 static void
@@ -866,12 +1070,21 @@ en_addr_sets_run(struct engine_node *node, void *data)
     sset_clear(&as->deleted);
     sset_clear(&as->updated);
     expr_const_sets_destroy(&as->addr_sets);
+    expr_const_sets_destroy(&as->members_added);
+    expr_const_sets_destroy(&as->members_deleted);
+
+    struct shash_node *node, *next;
+    SHASH_FOR_EACH_SAFE (node, next, &as->members) {        
+        sset_destroy(node->data);
+        free(node->data);
+        shash_delete(&as->members, node);        
+    }    
 
     struct sbrec_address_set_table *as_table =
         (struct sbrec_address_set_table *)EN_OVSDB_GET(
             engine_get_input("SB_address_set", node));
 
-    addr_sets_init(as_table, &as->addr_sets);
+    addr_sets_init(as_table, &as->addr_sets, &as->members);
 
     as->change_tracked = false;
     engine_set_node_state(node, EN_UPDATED);
@@ -885,13 +1098,14 @@ addr_sets_sb_address_set_handler(struct engine_node *node, void *data)
     sset_clear(&as->new);
     sset_clear(&as->deleted);
     sset_clear(&as->updated);
+    expr_const_sets_destroy(&as->members_added);
+    expr_const_sets_destroy(&as->members_deleted);
 
     struct sbrec_address_set_table *as_table =
         (struct sbrec_address_set_table *)EN_OVSDB_GET(
             engine_get_input("SB_address_set", node));
 
-    addr_sets_update(as_table, &as->addr_sets, &as->new,
-                     &as->deleted, &as->updated);
+    addr_sets_update(as_table, as);
 
     if (!sset_is_empty(&as->new) || !sset_is_empty(&as->deleted) ||
             !sset_is_empty(&as->updated)) {
@@ -904,13 +1118,92 @@ addr_sets_sb_address_set_handler(struct engine_node *node, void *data)
     return true;
 }
 
+struct port_group_members {
+    struct sset added;
+    struct sset deleted;
+    struct sset ports;
+};
+
 struct ed_type_port_groups{
-    struct shash port_groups;
+    struct shash port_groups_cs;
     bool change_tracked;
+
+    /* Tracked data */
     struct sset new;
     struct sset deleted;
-    struct sset updated;
+    struct sset updated;    
+    struct shash members_updated;
+    struct shash members_deleted_cs;
+    struct shash members_added_cs;     
+    
+    bool tracked;
 };
+
+static void
+initialise_port_group_members(struct shash *members_updated,
+                              const char *pg_name,
+                              struct sset *new_ports)
+{
+    struct port_group_members *members = xmalloc(sizeof *members);    
+    shash_add(members_updated, pg_name, members);
+    sset_init(&members->added);
+    sset_init(&members->deleted);
+    sset_init(&members->ports);   
+
+    sset_swap(&members->ports, new_ports)
+}
+
+static void
+clear_port_group_members(struct shash *members_updated)
+{
+    /* only clear added and deleted sset. ports will be retained
+       and used in engine run to generate addeded and deleted sset */
+    struct shash_node *node, *next;
+    SHASH_FOR_EACH_SAFE (node, next, members_updated) {
+        struct port_group_members *members = node->data;
+        if (sset_count(&members->ports)) {
+            sset_destroy(&members->ports);
+            sset_destroy(&members->added);
+            sset_destroy(&members->deleted);
+            free(members);
+            shash_delete(members_updated, node);
+        } else {
+            sset_clear(&members->added);
+            sset_clear(&members->deleted);   
+        }
+    }
+}
+
+static void
+destroy_port_group_members(struct shash *members_updated)
+{
+    struct shash_node *node, *next;
+    SHASH_FOR_EACH_SAFE (node, next, members_updated) {
+        struct port_group_members *members = node->data;
+        sset_destroy(&members->ports);
+        sset_destroy(&members->added);
+        sset_destroy(&members->deleted);
+        free(members);
+        shash_delete(members_updated, node);        
+    }
+}
+
+static void
+en_port_groups_clear_tracked_data(void *data_)
+{
+    struct ed_type_port_groups *pg = data_;
+
+    sset_clear(&pg->new);
+    sset_clear(&pg->deleted);
+    sset_clear(&pg->updated);
+
+    clear_port_group_members(&pg->members_updated);
+    
+    expr_const_sets_destroy(&pg->members_deleted_cs);
+    expr_const_sets_destroy(&pg->members_added_cs);
+
+    data->tracked = false;
+}
 
 static void *
 en_port_groups_init(struct engine_node *node OVS_UNUSED,
@@ -918,11 +1211,16 @@ en_port_groups_init(struct engine_node *node OVS_UNUSED,
 {
     struct ed_type_port_groups *pg = xzalloc(sizeof *pg);
 
-    shash_init(&pg->port_groups);
+    shash_init(&pg->port_groups_cs);
+    shash_init(&pg->members_updated);
     pg->change_tracked = false;
+    shash_init(&pg->members_deleted_cs);
+    shash_init(&pg->members_added_cs);
     sset_init(&pg->new);
     sset_init(&pg->deleted);
     sset_init(&pg->updated);
+    pg->tracked = false;
+
     return pg;
 }
 
@@ -930,31 +1228,95 @@ static void
 en_port_groups_cleanup(void *data)
 {
     struct ed_type_port_groups *pg = data;
-    expr_const_sets_destroy(&pg->port_groups);
-    shash_destroy(&pg->port_groups);
+    expr_const_sets_destroy(&pg->port_groups_cs);    
+    shash_destroy(&pg->port_groups_cs);
+
+    destroy_port_group_members(&pg->members_updated);
+    en_port_groups_clear_tracked_data(pg);
+    shash_destroy(&pg->members_deleted_cs);
+    shash_destroy(&pg->members_added_cs); 
+    shash_destroy(&pg->members_updated);
+
     sset_destroy(&pg->new);
     sset_destroy(&pg->deleted);
     sset_destroy(&pg->updated);
 }
 
+/* ANIL fix1 */
 static void
 en_port_groups_run(struct engine_node *node, void *data)
 {
     struct ed_type_port_groups *pg = data;
 
-    sset_clear(&pg->new);
-    sset_clear(&pg->deleted);
-    sset_clear(&pg->updated);
-    expr_const_sets_destroy(&pg->port_groups);
+    destroy_port_group_members(&pg->members_updated);
+    en_port_groups_clear_tracked_data(pg);
+
+    expr_const_sets_destroy(&pg->port_groups_cs);
+
+    struct ed_type_runtime_data *rt_data =
+        engine_get_input_data("runtime_data", node);            
 
     struct sbrec_port_group_table *pg_table =
         (struct sbrec_port_group_table *)EN_OVSDB_GET(
             engine_get_input("SB_port_group", node));
 
-    port_groups_init(pg_table, &pg->port_groups);
+    port_groups_init(pg_table, pg, &rt_data->local_lports);
 
     pg->change_tracked = false;
     engine_set_node_state(node, EN_UPDATED);
+}
+
+static bool
+port_groups_runtime_data_handler(struct engine_node *node, void *data)
+{
+    struct ed_type_port_groups *pg_data = data;
+
+    /* If SB_port_group and runtime binding changed simultaneously */
+    if (node->state != EN_UPDATED) {        
+        engine_set_node_state(node, EN_VALID);
+    }
+
+    struct ed_type_runtime_data *rt_data =
+        engine_get_input_data("runtime_data", node);
+
+    if (!rt_data->tracked) {        
+        return true;
+    }
+
+    struct hmap *tracked_dp_bindings = &rt_data->tracked_dp_bindings;
+    if (hmap_is_empty(tracked_dp_bindings)) {
+        return true;
+    }
+
+    struct sbrec_port_group_table *pg_table =
+        (struct sbrec_port_group_table *)EN_OVSDB_GET(
+            engine_get_input("SB_port_group", node));    
+    
+    pg_data->tracked = true;
+    
+    struct tracked_binding_datapath *tdp;
+    HMAP_FOR_EACH (tdp, node, tracked_dp_bindings) {
+        struct shash_node *shash_node;
+        SHASH_FOR_EACH (shash_node, &tdp->lports) {
+            struct tracked_binding_lport *lport = shash_node->data;            
+            const struct sbrec_port_group *pg;
+            SBREC_PORT_GROUP_TABLE_FOR_EACH (pg, pg_table) {
+                for (int i=0; i<pg->n_ports; i++) {
+                    if (!strcmp(lport->pb->logical_port, pg->ports[i])) {
+                        /* check port removed from chassis or added to chassis */                           
+                        sset_add(&pg_data->updated, pg->name);
+                        port_group_member_update(pg_data, pg->name,
+                                                 pg->ports, pg->n_ports,
+                                                 &rt_data->local_lports);                        
+                        engine_set_node_state(node, EN_UPDATED);
+                        break;
+                    }
+                }
+            }
+        }
+        
+    }    
+    return true;    
 }
 
 static bool
@@ -962,17 +1324,15 @@ port_groups_sb_port_group_handler(struct engine_node *node, void *data)
 {
     struct ed_type_port_groups *pg = data;
 
-    sset_clear(&pg->new);
-    sset_clear(&pg->deleted);
-    sset_clear(&pg->updated);
-
     struct sbrec_port_group_table *pg_table =
         (struct sbrec_port_group_table *)EN_OVSDB_GET(
             engine_get_input("SB_port_group", node));
 
-    port_groups_update(pg_table, &pg->port_groups, &pg->new,
-                     &pg->deleted, &pg->updated);
+    struct ed_type_runtime_data *rt_data =
+        engine_get_input_data("runtime_data", node);   
 
+    port_groups_update(pg_table, pg, &rt_data->local_lports);
+    
     if (!sset_is_empty(&pg->new) || !sset_is_empty(&pg->deleted) ||
             !sset_is_empty(&pg->updated)) {
         engine_set_node_state(node, EN_UPDATED);
@@ -1661,10 +2021,15 @@ static void init_lflow_ctx(struct engine_node *node,
     struct ed_type_addr_sets *as_data =
         engine_get_input_data("addr_sets", node);
     struct shash *addr_sets = &as_data->addr_sets;
+    struct shash *address_set_members_added = &as_data->members_added;
+    struct shash *address_set_members_deleted = &as_data->members_deleted;
 
     struct ed_type_port_groups *pg_data =
         engine_get_input_data("port_groups", node);
-    struct shash *port_groups = &pg_data->port_groups;
+    struct shash *port_groups = &pg_data->port_groups_cs;
+    struct shash *port_group_members_added = &pg_data->members_added_cs;
+    struct shash *port_group_members_deleted = &pg_data->members_deleted_cs;
+    struct hmap *tracked_dp_bindings = &rt_data->tracked_dp_bindings;
 
     l_ctx_in->sbrec_multicast_group_by_name_datapath =
         sbrec_mc_group_by_name_dp;
@@ -1679,7 +2044,12 @@ static void init_lflow_ctx(struct engine_node *node,
     l_ctx_in->chassis = chassis;
     l_ctx_in->local_datapaths = &rt_data->local_datapaths;
     l_ctx_in->addr_sets = addr_sets;
+    l_ctx_in->address_set_members_added = address_set_members_added;
+    l_ctx_in->address_set_members_deleted = address_set_members_deleted;
     l_ctx_in->port_groups = port_groups;
+    l_ctx_in->port_group_members_added = port_group_members_added;
+    l_ctx_in->port_group_members_deleted = port_group_members_deleted;
+    l_ctx_in->tracked_dp_bindings = tracked_dp_bindings;
     l_ctx_in->active_tunnels = &rt_data->active_tunnels;
     l_ctx_in->local_lport_ids = &rt_data->local_lport_ids;
 
@@ -1700,7 +2070,7 @@ en_flow_output_init(struct engine_node *node OVS_UNUSED,
     ovn_extend_table_init(&data->group_table);
     ovn_extend_table_init(&data->meter_table);
     data->conj_id_ofs = 1;
-    lflow_resource_init(&data->lflow_resource_ref);
+    lflow_resource_init(&data->lflow_resource_ref);    
     return data;
 }
 
@@ -1711,7 +2081,7 @@ en_flow_output_cleanup(void *data)
     ovn_desired_flow_table_destroy(&flow_output_data->flow_table);
     ovn_extend_table_destroy(&flow_output_data->group_table);
     ovn_extend_table_destroy(&flow_output_data->meter_table);
-    lflow_resource_destroy(&flow_output_data->lflow_resource_ref);
+    lflow_resource_destroy(&flow_output_data->lflow_resource_ref);    
 }
 
 static void
@@ -1937,7 +2307,7 @@ _flow_output_resource_ref_handler(struct engine_node *node, void *data,
 
     SSET_FOR_EACH (ref_name, deleted) {
         if (!lflow_handle_changed_ref(ref_type, ref_name, &l_ctx_in,
-                                      &l_ctx_out, &changed)) {
+                                      &l_ctx_out, &changed, REF_OP_DELETED)) {
             return false;
         }
         if (changed) {
@@ -1946,7 +2316,7 @@ _flow_output_resource_ref_handler(struct engine_node *node, void *data,
     }
     SSET_FOR_EACH (ref_name, updated) {
         if (!lflow_handle_changed_ref(ref_type, ref_name, &l_ctx_in,
-                                      &l_ctx_out, &changed)) {
+                                      &l_ctx_out, &changed, REF_OP_UPDATED)) {
             return false;
         }
         if (changed) {
@@ -1955,7 +2325,7 @@ _flow_output_resource_ref_handler(struct engine_node *node, void *data,
     }
     SSET_FOR_EACH (ref_name, new) {
         if (!lflow_handle_changed_ref(ref_type, ref_name, &l_ctx_in,
-                                      &l_ctx_out, &changed)) {
+                                      &l_ctx_out, &changed, REF_OP_ADDED)) {
             return false;
         }
         if (changed) {
@@ -1994,7 +2364,6 @@ flow_output_physical_flow_changes_handler(struct engine_node *node, void *data)
 
     if (pfc_data->recompute_physical_flows) {
         /* This indicates that we need to recompute the physical flows. */
-        physical_clear_unassoc_flows_with_db(&fo->flow_table);
         physical_run(&p_ctx, &fo->flow_table);
         return true;
     }
@@ -2191,7 +2560,7 @@ main(int argc, char *argv[])
                                       "physical_flow_changes");
     ENGINE_NODE(flow_output, "flow_output");
     ENGINE_NODE(addr_sets, "addr_sets");
-    ENGINE_NODE(port_groups, "port_groups");
+    ENGINE_NODE_WITH_CLEAR_TRACK_DATA(port_groups, "port_groups");
 
 #define SB_NODE(NAME, NAME_STR) ENGINE_NODE_SB(NAME, NAME_STR);
     SB_NODES
@@ -2205,8 +2574,7 @@ main(int argc, char *argv[])
 
     engine_add_input(&en_addr_sets, &en_sb_address_set,
                      addr_sets_sb_address_set_handler);
-    engine_add_input(&en_port_groups, &en_sb_port_group,
-                     port_groups_sb_port_group_handler);
+
 
     /* Engine node physical_flow_changes indicates whether
      * we can recompute only physical flows or we can
@@ -2267,6 +2635,11 @@ main(int argc, char *argv[])
                      runtime_data_sb_datapath_binding_handler);
     engine_add_input(&en_runtime_data, &en_sb_port_binding,
                      runtime_data_sb_port_binding_handler);
+
+    engine_add_input(&en_port_groups, &en_sb_port_group,
+                     port_groups_sb_port_group_handler);
+    engine_add_input(&en_port_groups, &en_runtime_data,
+                     port_groups_runtime_data_handler);
 
     struct engine_arg engine_arg = {
         .sb_idl = ovnsb_idl_loop.idl,

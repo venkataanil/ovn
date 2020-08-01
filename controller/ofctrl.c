@@ -709,6 +709,41 @@ ofctrl_remove_flows(struct ovn_desired_flow_table *flow_table,
     ovn_extend_table_remove_desired(meters, sb_uuid);
 }
 
+/* ANIL */
+void
+ofctrl_check_and_remove_flow(struct ovn_desired_flow_table *flow_table,
+                          uint8_t table_id, uint16_t priority,
+                          uint64_t cookie, const struct match *match,
+                          const struct ofpbuf *actions,
+                          const struct uuid *sb_uuid,
+                          bool log_duplicate_flow)
+{
+    struct ovn_flow *f = ovn_flow_alloc(table_id, priority, cookie, match,
+                                        actions, sb_uuid);
+
+    ovn_flow_log(f, "ofctrl_check_and_remove_flow");
+
+    struct ovn_flow *existing;
+    existing = ovn_flow_lookup(&desired_flows->match_flow_table, f, false);
+    if (existing) {        
+        hmap_remove(&flow_table->match_flow_table, &existing->match_hmap_node);
+        hindex_remove(&flow_table->uuid_flow_table, &f->uuid_hindex_node);
+        ovn_flow_destroy(existing);
+    }
+    ovn_flow_destroy(f);
+}
+
+/* ANIL */
+void
+ofctrl_remove_specific_flow(struct ovn_desired_flow_table *desired_flows,
+                uint8_t table_id, uint16_t priority, uint64_t cookie,
+                const struct match *match, const struct ofpbuf *actions,
+                const struct uuid *sb_uuid)
+{
+    ofctrl_check_and_remove_flow(desired_flows, table_id, priority, cookie,
+                              match, actions, sb_uuid, true);
+}
+
 void
 ofctrl_add_flow(struct ovn_desired_flow_table *desired_flows,
                 uint8_t table_id, uint16_t priority, uint64_t cookie,

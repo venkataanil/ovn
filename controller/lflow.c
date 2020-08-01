@@ -52,7 +52,14 @@ lflow_init(void)
 struct lookup_port_aux {
     struct ovsdb_idl_index *sbrec_multicast_group_by_name_datapath;
     struct ovsdb_idl_index *sbrec_port_binding_by_name;
+    const struct sbrec_datapath_binding *dp;    
+};
+
+struct lookup_tracked_port_aux {
+    struct ovsdb_idl_index *sbrec_multicast_group_by_name_datapath;
+    struct ovsdb_idl_index *sbrec_port_binding_by_name;
     const struct sbrec_datapath_binding *dp;
+    struct hmap *tracked_dp_bindings;
 };
 
 struct condition_aux {
@@ -63,6 +70,7 @@ struct condition_aux {
     /* Resource reference to store the port name referenced
      * in is_chassis_resident() to the logical flow. */
     struct lflow_resource_ref *lfrr;
+    bool lflow_ref_portgroup_addrset;
 };
 
 static bool
@@ -128,11 +136,13 @@ is_chassis_resident_cb(const void *c_aux_, const char *port_name)
     }
 
     /* Store the port_name to lflow reference. */
-    int64_t dp_id = pb->datapath->tunnel_key;
-    char buf[16];
-    get_unique_lport_key(dp_id, pb->tunnel_key, buf, sizeof(buf));
-    lflow_resource_add(c_aux->lfrr, REF_TYPE_PORTBINDING, buf,
-                       &c_aux->lflow->header_.uuid);
+    if (!c_aux->lflow_ref_portgroup_addrset) {    
+        int64_t dp_id = pb->datapath->tunnel_key;
+        char buf[16];
+        get_unique_lport_key(dp_id, pb->tunnel_key, buf, sizeof(buf));
+        lflow_resource_add(c_aux->lfrr, REF_TYPE_PORTBINDING, buf,
+                        &c_aux->lflow->header_.uuid);
+    }
 
     if (strcmp(pb->type, "chassisredirect")) {
         /* for non-chassisredirect ports */
@@ -394,10 +404,10 @@ lflow_handle_changed_flows(struct lflow_ctx_in *l_ctx_in,
 }
 
 bool
-lflow_handle_changed_ref(enum ref_type ref_type, const char *ref_name,
+lflow_handle_ref_member_updates(enum ref_type ref_type, const char *ref_name,
                          struct lflow_ctx_in *l_ctx_in,
                          struct lflow_ctx_out *l_ctx_out,
-                         bool *changed)
+                         bool *changed, bool added, const struct shash *ref_shash)
 {
     struct ref_lflow_node *rlfn =
         ref_lflow_lookup(&l_ctx_out->lfrr->ref_lflow_table, ref_type,
@@ -410,6 +420,102 @@ lflow_handle_changed_ref(enum ref_type ref_type, const char *ref_name,
              " name: %s.", ref_type, ref_name);
     *changed = false;
     bool ret = true;
+
+    /*ANIL
+    struct lflow_resource_ref {} maintaints references between resources and
+    the flows and not between resource members and ports. So we shouldn't
+    updated references during adding or deleting porft group member or address set members
+    */
+
+    /* ANIL TODO
+    Now we try to reprogram flows (i.e calling consider_logical_flow) for Port Group members
+    which don't belong to this hypervisor. However consider_logical_flow filters these ports
+    and won't generate flows.
+    
+    As an enhancement, PG resource in this hypervisor should maintain only members belonging
+    to this hypervisor. This avoids lexer parsing other hypervisor ports. 
+    */
+    
+    /* Re-parse the related lflows. */
+    LIST_FOR_EACH (lrln, ref_list, &rlfn->ref_lflow_head) {
+        const struct sbrec_logical_flow *lflow =
+            sbrec_logical_flow_table_get_for_uuid(l_ctx_in->logical_flow_table,
+                                                  &lrln->lflow_uuid);
+        if (!lflow) {
+            VLOG_DBG("Reprocess lflow "UUID_FMT" for resource type: %d,"
+                     " name: %s - not found.",
+                     UUID_ARGS(&lrln->lflow_uuid),
+                     ref_type, ref_name);
+            continue;
+        }
+        VLOG_DBG("Reprocess lflow "UUID_FMT" for resource type: %d,"
+                 " name: %s.",
+                 UUID_ARGS(&lrln->lflow_uuid),
+                 ref_type, ref_name);
+        
+        /* ANIL check if condition needed or not */
+        if(!consider_logical_flow_for_pg_as_member_updates(lflow, l_ctx_in, l_ctx_out,
+                                                          ref_type, added, ref_shash)) {
+            ret = false;
+            break;
+        }
+        *changed = true;
+    }
+    return ret;
+}
+
+/* ANIL END */
+
+bool
+lflow_handle_changed_ref(enum ref_type ref_type, const char *ref_name,
+                         struct lflow_ctx_in *l_ctx_in,
+                         struct lflow_ctx_out *l_ctx_out,
+                         bool *changed, enum ref_op)
+{
+    struct ref_lflow_node *rlfn =
+        ref_lflow_lookup(&l_ctx_out->lfrr->ref_lflow_table, ref_type,
+                         ref_name);
+    if (!rlfn) {
+        *changed = false;
+        return true;
+    }
+    VLOG_DBG("Handle changed lflow reference for resource type: %d,"
+             " name: %s.", ref_type, ref_name);
+    *changed = false;
+    bool ret = true;
+   
+    if (ref_op == REF_OP_UPDATED) {                
+        if (ref_type == REF_TYPE_PORTGROUP) {
+            if (shash_find(l_ctx_in->port_group_members_added, ref_name)) {            
+                ret = lflow_handle_ref_member_updates(ref_type, ref_name, l_ctx_in,
+                                                      l_ctx_out, changed, true,
+                                                      l_ctx_in->port_group_members_added);
+                expr_const_sets_remove(l_ctx_in->port_group_members_added, ref_name);
+            }
+            if (shash_find(l_ctx_in->port_group_members_deleted, ref_name)) {
+                ret = lflow_handle_ref_member_updates(ref_type, ref_name, l_ctx_in,
+                                                      l_ctx_out, changed, false,
+                                                      l_ctx_in->port_group_members_deleted);         
+                expr_const_sets_remove(l_ctx_in->port_group_members_deleted, ref_name);
+            } 
+            return ret;          
+        }
+        if (ref_type == REF_TYPE_ADDRSET) {
+            if (shash_find(l_ctx_in->address_set_members_added, ref_name)) {
+                ret = lflow_handle_ref_member_updates(ref_type, ref_name, l_ctx_in,
+                                                     l_ctx_out, changed, true,
+                                                     l_ctx_in->address_set_members_added);
+                expr_const_sets_remove(l_ctx_in->address_set_members_added, ref_name);
+            }
+            if (shash_find(l_ctx_in->address_set__members_deleted, ref_name)) {            
+                ret = lflow_handle_ref_member_updates(ref_type, ref_name, l_ctx_in,
+                                                     l_ctx_out, changed, false,
+                                                     l_ctx_in->address_set__members_deleted);
+                expr_const_sets_remove(l_ctx_in->address_set_members_deleted, ref_name);
+            }
+            return ret;            
+        }
+    }
 
     hmap_remove(&l_ctx_out->lfrr->ref_lflow_table, &rlfn->node);
 
@@ -562,6 +668,7 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
     /* Translate OVN match into table of OpenFlow matches. */
     struct hmap matches;
     struct expr *expr;
+    bool lflow_ref_portgroup_addrset = false;
 
     struct sset addr_sets_ref = SSET_INITIALIZER(&addr_sets_ref);
     struct sset port_groups_ref = SSET_INITIALIZER(&port_groups_ref);
@@ -569,7 +676,7 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
                              l_ctx_in->port_groups,
                              &addr_sets_ref, &port_groups_ref,
                              lflow->logical_datapath->tunnel_key,
-                             &error);
+                             &error);                             
     const char *addr_set_name;
     SSET_FOR_EACH (addr_set_name, &addr_sets_ref) {
         lflow_resource_add(l_ctx_out->lfrr, REF_TYPE_ADDRSET, addr_set_name,
@@ -579,6 +686,10 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
     SSET_FOR_EACH (port_group_name, &port_groups_ref) {
         lflow_resource_add(l_ctx_out->lfrr, REF_TYPE_PORTGROUP,
                            port_group_name, &lflow->header_.uuid);
+    }
+    /* ref created for new/del PG,AS or ACL*/
+    if (!sset_is_empty(&port_groups_ref) || !sset_is_empty(&addr_sets_ref)) {
+        lflow_ref_portgroup_addrset = true;
     }
     sset_destroy(&addr_sets_ref);
     sset_destroy(&port_groups_ref);
@@ -612,7 +723,8 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
         .chassis = l_ctx_in->chassis,
         .active_tunnels = l_ctx_in->active_tunnels,
         .lflow = lflow,
-        .lfrr = l_ctx_out->lfrr
+        .lfrr = l_ctx_out->lfrr,
+        .lflow_ref_portgroup_addrset = lflow_ref_portgroup_addrset
     };
     expr = expr_simplify(expr, is_chassis_resident_cb, &cond_aux);
     expr = expr_normalize(expr);
@@ -668,8 +780,17 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
                 int64_t dp_id = lflow->logical_datapath->tunnel_key;
                 char buf[16];
                 get_unique_lport_key(dp_id, port_id, buf, sizeof(buf));
-                lflow_resource_add(l_ctx_out->lfrr, REF_TYPE_PORTBINDING, buf,
+                /*
+                Dont maintain references between ports and logical flows which is referencing port groups.
+                Below is hit, when a new port is added (still not bound)
+                1) logical flow created for the port (some flows reference port like inport== etc..)
+                2) As logical port may or many not be bound to a chassis (PB entry exists but with or without chassis)
+                In the above case we add a lflow_ref entry for the port binding reference.               
+                */
+                if (!lflow_ref_portgroup_addrset) {
+                    lflow_resource_add(l_ctx_out->lfrr, REF_TYPE_PORTBINDING, buf,
                                    &lflow->header_.uuid);
+                }
                 if (!sset_contains(l_ctx_in->local_lport_ids, buf)) {
                     VLOG_DBG("lflow "UUID_FMT
                              " port %s in match is not local, skip",
@@ -711,6 +832,286 @@ consider_logical_flow(const struct sbrec_logical_flow *lflow,
     return update_conj_id_ofs(l_ctx_out->conj_id_ofs, n_conjs);
 }
 
+static bool
+lookup_tracked_port_cb(const void *aux_, const char *port_name, unsigned int *portp)
+{
+    const struct lookup_tracked_port_aux *aux = aux_;
+
+    const struct sbrec_port_binding *pb
+        = lport_lookup_by_name(aux->sbrec_port_binding_by_name, port_name);
+    if (pb && pb->datapath == aux->dp) {
+        *portp = pb->tunnel_key;
+        return true;
+    }
+
+    if (aux->tracked_datapaths) {
+        struct tracked_binding_datapath *tracked_dp =
+            tracked_binding_datapath_find(aux->tracked_datapaths, aux->dp);
+        if (tracked_dp) {
+            struct tracked_binding_lport *lport = 
+                shash_find_data(&tracked_dp->lports, port_name);
+            if (lport) {        
+                const struct sbrec_port_binding *binding = lport->pb;
+                if (binding) {
+                    *portp = binding->tunnel_key;
+                    return true;
+                }
+            }
+        }
+    }       
+    return false;
+}
+
+static bool
+pg_as_is_chassis_resident_cb(const void *c_aux_, const char *port_name)
+{
+    return true;
+}
+/* ANIL START
+/* This function will be called when PG or AS member updated*/
+static bool
+consider_logical_flow_for_pg_as_member_updates(const struct sbrec_logical_flow *lflow,
+                      struct lflow_ctx_in *l_ctx_in, struct lflow_ctx_out *l_ctx_out,
+                      enum ref_type ref_type, bool added, const struct shash *ref_shash)
+{
+    /* Determine translation of logical table IDs to physical table IDs. */
+    bool ingress = !strcmp(lflow->pipeline, "ingress");
+
+    const struct sbrec_datapath_binding *ldp = lflow->logical_datapath;
+    if (!ldp) {
+        VLOG_DBG("lflow "UUID_FMT" has no datapath binding, skip",
+                 UUID_ARGS(&lflow->header_.uuid));
+        return true;
+    }
+    if (!get_local_datapath(l_ctx_in->local_datapaths, ldp->tunnel_key)) {
+        VLOG_DBG("lflow "UUID_FMT" is not for local datapath, skip",
+                 UUID_ARGS(&lflow->header_.uuid));
+        return true;
+    }
+
+    /* Determine translation of logical table IDs to physical table IDs. */
+    uint8_t first_ptable = (ingress
+                            ? OFTABLE_LOG_INGRESS_PIPELINE
+                            : OFTABLE_LOG_EGRESS_PIPELINE);
+    uint8_t ptable = first_ptable + lflow->table_id;
+    uint8_t output_ptable = (ingress
+                             ? OFTABLE_REMOTE_OUTPUT
+                             : OFTABLE_SAVE_INPORT);
+
+
+    /* Translate OVN match into table of OpenFlow matches. */
+    struct hmap matches;
+    struct expr *expr;
+    /* ANIL */
+    if (ref_type == REF_TYPE_ADDRSET) {
+        expr = expr_parse_string(lflow->match, &symtab, ref_shash,        
+                             l_ctx_in->port_groups, NULL, NULL,                             
+                             lflow->logical_datapath->tunnel_key,
+                             &error); 
+    }
+
+    if (ref_type == REF_TYPE_PORTGROUP) { 
+        expr = expr_parse_string(lflow->match, &symtab, l_ctx_in->addr_sets,        
+                             ref_hash, NULL, NULL,                             
+                             lflow->logical_datapath->tunnel_key,
+                             &error);     
+    }
+
+
+    /* ANIL removed some code here */
+    if (!error) {
+        if (prereqs) {
+            expr = expr_combine(EXPR_T_AND, expr, prereqs);
+            prereqs = NULL;
+        }
+        expr = expr_annotate(expr, &symtab, &error);
+    }
+    if (error) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+        VLOG_WARN_RL(&rl, "error parsing match \"%s\": %s",
+                     lflow->match, error);
+        expr_destroy(prereqs);
+        free(error);
+        return true;
+    }
+
+    struct lookup_tracked_port_aux aux = {
+        .sbrec_multicast_group_by_name_datapath
+            = l_ctx_in->sbrec_multicast_group_by_name_datapath,
+        .sbrec_port_binding_by_name = l_ctx_in->sbrec_port_binding_by_name,
+        .dp = lflow->logical_datapath,
+        .tracked_datapaths = l_ctx_in->tracked_dp_bindings
+    };
+    struct condition_aux cond_aux = {
+        .sbrec_port_binding_by_name = l_ctx_in->sbrec_port_binding_by_name,
+        .chassis = l_ctx_in->chassis,
+        .active_tunnels = l_ctx_in->active_tunnels,
+        .lflow = lflow,
+        .lfrr = l_ctx_out->lfrr,
+        .lflow_ref_portgroup_addrset = false
+    };
+    /* As ACLs will be for logical ports on this chassis, do we need is_chassis_resident_cb here?*/
+    expr = expr_simplify(expr, pg_as_is_chassis_resident_cb, &cond_aux);
+    expr = expr_normalize(expr);
+    uint32_t n_conjs = expr_to_matches(expr, lookup_tracked_port_cb, &aux,
+                                       &matches);
+    expr_destroy(expr);
+
+    if (hmap_is_empty(&matches)) {
+        VLOG_DBG("lflow "UUID_FMT" matches are empty, skip",
+                 UUID_ARGS(&lflow->header_.uuid));
+        expr_matches_destroy(&matches);
+        return true;
+    }
+
+    /* ANIL */
+    /* No actions required for deleting flows */
+    if (!added) {
+        struct expr_match *m;
+        HMAP_FOR_EACH (m, hmap_node, &matches) {
+            match_set_metadata(&m->match,
+                            htonll(lflow->logical_datapath->tunnel_key));
+            if (m->match.wc.masks.conj_id) {
+                m->match.flow.conj_id += *l_ctx_out->conj_id_ofs;
+            }
+            if (datapath_is_switch(ldp)) {
+                unsigned int reg_index
+                    = (ingress ? MFF_LOG_INPORT : MFF_LOG_OUTPORT) - MFF_REG0;
+                int64_t port_id = m->match.flow.regs[reg_index];
+                if (port_id) {
+                    int64_t dp_id = lflow->logical_datapath->tunnel_key;
+                    char buf[16];
+                    get_unique_lport_key(dp_id, port_id, buf, sizeof(buf));
+                    if (!sset_contains(l_ctx_in->local_lport_ids, buf)) {
+                        VLOG_DBG("lflow "UUID_FMT
+                                " port %s in match is not local, skip",
+                                UUID_ARGS(&lflow->header_.uuid),
+                                buf);
+                        continue;
+                    }
+                    ofctrl_remove_specific_flow(l_ctx_out->flow_table, ptable, lflow->priority,
+                            lflow->header_.uuid.parts[0], &m->match, NULL,
+                            &lflow->header_.uuid);                     
+                }
+            }
+        }
+        expr_matches_destroy(&matches);
+        return;
+    }
+
+    /* ANIL Adding flows */
+
+    /* Parse OVN logical actions.
+     *
+     * XXX Deny changes to 'outport' in egress pipeline. */
+    uint64_t ovnacts_stub[1024 / 8];
+    struct ofpbuf ovnacts = OFPBUF_STUB_INITIALIZER(ovnacts_stub);
+    struct ovnact_parse_params pp = {
+        .symtab = &symtab,
+        .dhcp_opts = NULL,
+        .dhcpv6_opts = NULL,
+        .nd_ra_opts = NULL,
+        .controller_event_opts = NULL,
+
+        .pipeline = ingress ? OVNACT_P_INGRESS : OVNACT_P_EGRESS,
+        .n_tables = LOG_PIPELINE_LEN,
+        .cur_ltable = lflow->table_id,
+    };
+    struct expr *prereqs;
+    char *error;
+
+    error = ovnacts_parse_string(lflow->actions, &pp, &ovnacts, &prereqs);
+    if (error) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
+        VLOG_WARN_RL(&rl, "error parsing actions \"%s\": %s",
+                     lflow->actions, error);
+        free(error);
+        ovnacts_free(ovnacts.data, ovnacts.size);
+        ofpbuf_uninit(&ovnacts);
+        return true;
+    }
+
+    
+    /* Encode OVN logical actions into OpenFlow. */
+    uint64_t ofpacts_stub[1024 / 8];
+    struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(ofpacts_stub);
+    struct ovnact_encode_params ep = {
+        .lookup_port = lookup_port_cb,
+        .tunnel_ofport = tunnel_ofport_cb,
+        .aux = &aux,
+        .is_switch = datapath_is_switch(ldp),
+        .group_table = l_ctx_out->group_table,
+        .meter_table = l_ctx_out->meter_table,
+        .lflow_uuid = lflow->header_.uuid,
+
+        .pipeline = ingress ? OVNACT_P_INGRESS : OVNACT_P_EGRESS,
+        .ingress_ptable = OFTABLE_LOG_INGRESS_PIPELINE,
+        .egress_ptable = OFTABLE_LOG_EGRESS_PIPELINE,
+        .output_ptable = output_ptable,
+        .mac_bind_ptable = OFTABLE_MAC_BINDING,
+        .mac_lookup_ptable = OFTABLE_MAC_LOOKUP,
+    };
+    ovnacts_encode(ovnacts.data, ovnacts.size, &ep, &ofpacts);
+    ovnacts_free(ovnacts.data, ovnacts.size);
+    ofpbuf_uninit(&ovnacts);
+
+    /* Prepare the OpenFlow matches for adding to the flow table. */
+    struct expr_match *m;
+    HMAP_FOR_EACH (m, hmap_node, &matches) {
+        match_set_metadata(&m->match,
+                           htonll(lflow->logical_datapath->tunnel_key));
+        if (m->match.wc.masks.conj_id) {
+            m->match.flow.conj_id += *l_ctx_out->conj_id_ofs;
+        }
+        if (datapath_is_switch(ldp)) {
+            unsigned int reg_index
+                = (ingress ? MFF_LOG_INPORT : MFF_LOG_OUTPORT) - MFF_REG0;
+            int64_t port_id = m->match.flow.regs[reg_index];
+            if (port_id) {
+                int64_t dp_id = lflow->logical_datapath->tunnel_key;
+                char buf[16];
+                get_unique_lport_key(dp_id, port_id, buf, sizeof(buf));
+                if (!sset_contains(l_ctx_in->local_lport_ids, buf)) {
+                    VLOG_DBG("lflow "UUID_FMT
+                             " port %s in match is not local, skip",
+                             UUID_ARGS(&lflow->header_.uuid),
+                             buf);
+                    continue;
+                }
+            }
+        }
+        if (!m->n) {            
+            ofctrl_add_flow(l_ctx_out->flow_table, ptable, lflow->priority,
+                            lflow->header_.uuid.parts[0], &m->match, &ofpacts,
+                            &lflow->header_.uuid);
+             
+        } else {
+            uint64_t conj_stubs[64 / 8];
+            struct ofpbuf conj;
+
+            ofpbuf_use_stub(&conj, conj_stubs, sizeof conj_stubs);
+            for (int i = 0; i < m->n; i++) {
+                const struct cls_conjunction *src = &m->conjunctions[i];
+                struct ofpact_conjunction *dst;
+
+                dst = ofpact_put_CONJUNCTION(&conj);
+                dst->id = src->id + *l_ctx_out->conj_id_ofs;
+                dst->clause = src->clause;
+                dst->n_clauses = src->n_clauses;
+            }            
+            ofctrl_add_or_append_flow(l_ctx_out->flow_table, ptable,
+                                      lflow->priority, 0,
+                                      &m->match, &conj, &lflow->header_.uuid);            
+            ofpbuf_uninit(&conj);
+        }
+    }
+
+    /* Clean up. */
+    expr_matches_destroy(&matches);
+    ofpbuf_uninit(&ofpacts);
+    return update_conj_id_ofs(l_ctx_out->conj_id_ofs, n_conjs);
+}
+/* ANIL END */
 static void
 put_load(const uint8_t *data, size_t len,
          enum mf_field_id dst, int ofs, int n_bits,
